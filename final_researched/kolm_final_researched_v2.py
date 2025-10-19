@@ -1,72 +1,107 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-kolm_final_researched.py
-========================
+kolm_final_researched_v2.py
+===========================
 
 This module implements a deeply researched prototype compressor/decompressor
-guided by the "前布尔电路后统计概率" (boolean‑circuit first, probability last)
-philosophy.  The aim is to expose and remove as much structure as possible
-using cheap, reversible bitwise transforms before handing the residual data
-to classical entropy coders.  All transformations are written from scratch
-without relying on external compression libraries.  In addition to the
-bijective BWT and move‑to‑front (MTF) pipeline, this version introduces
-several novel binary circuit modules such as bit‑plane interleaving,
-LFSR whitening, nibble swapping and bit reversal.  A model selector
-chooses among these transformations and simple dictionary coders based
-on a minimum description length (MDL) criterion.
+guided by the "前布尔电路后统计概率" (boolean-circuit first, probability last)
+philosophy. The goal is to expose and remove as much structure as possible
+via cheap, reversible bitwise transforms before handing the residual to
+classical entropy/dictionary coders. All transformations are written from
+scratch without external compression libraries.
+
+Compared with earlier revisions, V2 makes two key changes:
+- **Chunking modes:** supports both fixed-size chunking and a non-recursive,
+  strict **FastCDC** (gear-hash) splitter. The container header uses the
+  high bit of the 32-bit "block_size" field as a **mode flag**
+  (`0 = FIXED`, `1 = CDC`); the remaining 31 bits store the scale
+  (fixed `block_size` or CDC `avg_size`). Decoding does not depend on the
+  mode and remains fully compatible.
+- **Pipeline hygiene:** removes the invalid **BBWT+LFSR mixing** pipelines.
+  The LFSR-based component is retained **only** as a standalone predictor
+  model. A **new V2 pipeline** is added to the candidate set.
 
 Features provided:
 
-  * Content‑defined chunking via a simplified FastCDC (gear hash) implementation.
-  * Duval's linear time Lyndon factorisation and a bijective BWT (BBWT)
-    constructed by merging the cyclic rotations of each factor.  The
-    theoretical basis can be found in CP‑Algorithms and BWT literature【154237816494091†L294-L301】【555806496076120†L507-L516】.
-  * Move‑to‑front encoding to bring repeated symbols closer to zero.
-  * Bitwise reversible modules:
-      ‑ **Bit plane interleaving**: interleave the bitplanes of successive
-        bytes to group high‑order bits together.
-      ‑ **LFSR whitening**: treat the byte stream as a sequence of 8‑bit
-        states and predict the next bit via a small LFSR; XORing the
-        predicted bit sequence removes linear patterns【879695488005067†L166-L179】.
-      ‑ **Nibble swapping**: swap the high and low 4‑bit nibbles of each
-        byte; applying twice returns the original.
-      ‑ **Bit reversal**: reverse the bit order within each byte using a
-        precomputed lookup table.
-  * Integer coders: Rice/Golomb encoding for geometric distributions【966564189297361†L152-L170】,
-    Elias gamma/δ codes for metadata, and ULEB128 for variable length
-    integers.
-  * Lightweight dictionary coders: a naive LZ77 encoder/decoder and a
-    simple Re‑Pair grammar compressor【967225900425034†L139-L166】 to handle long
-    repeats.
-  * An MDL‑based model selector that chooses the smallest representation
-    among raw, XOR, BBWT→Rice (with any combination of bitwise modules),
-    LZ77, LFSR predictor and Re‑Pair.
-  * A simple container format beginning with ``b'KOLR'`` (Kolmogorov
-    Learned Researcher) followed by block descriptors.
+- **Content-defined chunking (FastCDC):**
+  deterministic 256×32-bit gear table (fixed seed), mask selection derived
+  from the target average size, linear scan between `[min, max)` with
+  forced cut at `max`, and orphan-tail merge to avoid tiny trailing blocks.
+- **BBWT line:** Duval’s linear-time Lyndon factorization → bijective BWT
+  (BBWT) by merging rotations per factor; then **MTF** to cluster small
+  integers (cf. standard BWT/BBWT literature).
+- **Reversible bitwise modules** (toggleable inside the BBWT→MTF→Rice line):
+  - Bit-plane interleaving (group high-order planes across bytes)
+  - Nibble swap (high/low 4-bit exchange; self-inverse)
+  - Bit-reversal within byte (via LUT)
+  - **Gray code** option
+  *(Note: LFSR is **not** a bitwise sub-module in V2; it exists as a
+  standalone predictor candidate only.)*
+- **Integer coders:** Rice/Golomb for geometric-like symbols; Elias gamma/δ
+  for small metadata; ULEB128 for general variable-length integers.
+- **Dictionary/grammar models:** a lightweight **LZ77** and a simple
+  **Re-Pair** to capture long repeats.
+- **Model selection (MDL):** per-block evaluation among
+  RAW, XOR, BBWT→MTF→Rice (+ optional bitwise variants), LZ77,
+  **LFSR predictor**, **Re-Pair**, and the **V2 new pipeline**; the smallest
+  representation is chosen independently for each block.
+- **Container format:** magic ``b'KOLR'`` +
+  packed mode/size word +
+  total original length (u32) +
+  number of blocks (u16) +
+  for each block: method_id (u8), original_length (u32),
+  payload_length (u32), payload bytes.
+  *(Tip: u16 limits blocks to ≤ 65,535; switch to ULEB128 if you need more.)*
 
-The encoder works on blocks emitted by the CDC stage.  Each block is
-independently transformed and encoded; metadata describing the chosen
-model and its parameters is recorded in the header.  The decoder uses
-this metadata to invert the transforms and reconstruct the original
-input.  All code paths are fully lossless and reversible.
+Operation:
 
-Usage examples:
-    python3 kolm_final_researched.py input.bin        # compress
-    python3 kolm_final_researched.py -d input.kolr    # decompress
-    python3 kolm_final_researched.py --experiment     # run built‑in experiments
+- The encoder works on chunk boundaries (fixed or CDC). Each block is
+  transformed and encoded independently; the selected model is recorded
+  implicitly by `method_id`. The decoder inverts each block using the same
+  ordering of decoders; it does **not** depend on the chunking mode bit.
 
-This file is self‑contained and can be studied as an educational
-reference on combining string algorithms and bit tricks for data
-compression.
+Usage:
+    # Compress (fixed blocks, default 8192 bytes)
+    python3 kolm_final_researched_v2.py input.bin
+
+    # Compress with FastCDC (avg_size from --block; min=avg//2, max=2*avg)
+    python3 kolm_final_researched_v2.py --FastCDC -b 8192 input.bin
+
+    # Decompress
+    python3 kolm_final_researched_v2.py -d input.kolr
+
+    # Built-in experiment
+    python3 kolm_final_researched_v2.py --experiment
+
+This file is self-contained and serves as an educational reference for
+combining string algorithms (Duval/BBWT/MTF) with bit-level circuit tricks
+under an MDL-driven per-block selection strategy.
 """
 
 from __future__ import annotations
+import itertools
 from collections import Counter
 import math
 import struct
 import random
 from typing import List, Tuple, Dict, Callable, Optional, Any
+
+# 全局开关（CLI 会设置）
+G_NO_LZ77: bool = False
+G_ONLY_METHOD: Optional[str] = None  # 例如 'v2_new' / 'lz77' / 'raw' 等
+
+# 进度开关（由 CLI 设置）
+G_PROGRESS: bool = False
+
+def _print_progress(label: str, i: int, n: int, final: bool = False) -> None:
+    """简单的块级进度打印：[{label}] block i/n ... / done."""
+    if not G_PROGRESS:
+        return
+    if not final:
+        print(f"[{label}] block {i}/{n} ...", end="\r", flush=True)
+    else:
+        print(f"[{label}] block {n}/{n} done.", flush=True)
 
 ###############################################################################
 # Utility functions: ULEB128
@@ -101,45 +136,99 @@ def uleb128_decode_stream(data: bytes, pos: int = 0) -> Tuple[int, int]:
         shift += 7
 
 ###############################################################################
-# FastCDC content‑defined chunking (simplified)
+# FastCDC content‑defined chunking
 ###############################################################################
 
-def _gear_table(seed: int = 2025) -> List[int]:
-    rng = random.Random(seed)
-    return [rng.getrandbits(32) for _ in range(256)]
-
-_GEAR = _gear_table()
-
-def cdc_fast_boundaries(data: bytes, min_size: int = 4096, avg_size: int = 8192,
-                        max_size: int = 16384) -> List[Tuple[int, int]]:
-    """Identify cut boundaries using a fast gear hash (simplified FastCDC).
-
-    FastCDC chooses a mask to achieve a target average chunk size and
-    searches for positions where the rolling hash masked bits are zero【629903081498632†L40-L52】.  If no
-    boundary is found before ``max_size``, the chunk is forcibly cut.
+# =========================================
+# 确定性的 GEAR 表（固定种子，跨平台可复现）
+# =========================================
+def _make_gear(seed: int = 0x243F6A88) -> List[int]:
     """
+    生成 256 项 32-bit gear 表，基于 xorshift32 的确定性序列。
+    为避免出现 0 值，最后与 1 做 OR。
+    """
+    x = seed & 0xFFFFFFFF
+    tbl: List[int] = []
+    for _ in range(256):
+        # xorshift32
+        x ^= (x << 13) & 0xFFFFFFFF
+        x ^= (x >> 17) & 0xFFFFFFFF
+        x ^= (x << 5)  & 0xFFFFFFFF
+        tbl.append((x | 1) & 0xFFFFFFFF)
+    return tbl
+
+_GEAR: List[int] = _make_gear()
+
+# =========================================
+# FastCDC（严格、非递归）
+# =========================================
+def _clamp_mask_bits(avg_size: int) -> int:
+    if avg_size <= 0:
+        return 6
+    k = (avg_size).bit_length() - 1
+    if k < 6:  k = 6
+    if k > 20: k = 20
+    return k
+
+def _roll_gear(h: int, byte_val: int) -> int:
+    return ((h << 1) & 0xFFFFFFFF) + _GEAR[byte_val]
+
+def cdc_fast_boundaries_strict(data: bytes,
+                               min_size: int = 4096,
+                               avg_size: int = 8192,
+                               max_size: int = 16384,
+                               merge_orphan_tail: bool = True) -> List[Tuple[int, int]]:
     n = len(data)
     if n == 0:
         return []
-    # choose mask bits based on average size
-    k = max(6, min(20, (avg_size).bit_length() - 1))
+    if not (min_size > 0 and min_size <= avg_size <= max_size):
+        raise ValueError("Require 0 < min_size ≤ avg_size ≤ max_size")
+    if avg_size < 64:
+        raise ValueError("avg_size too small; use ≥ 64")
+
+    k = _clamp_mask_bits(avg_size)
     mask = (1 << k) - 1
+
     boundaries: List[Tuple[int, int]] = []
     i = 0
     while i < n:
         start = i
-        h = 0
         end_min = min(n, start + min_size)
         end_max = min(n, start + max_size)
         i = end_min
+        h = 0
+        found = False
         while i < end_max:
-            h = ((h << 1) & 0xFFFFFFFF) + _GEAR[data[i]]
+            h = _roll_gear(h, data[i])
             if (h & mask) == 0:
                 i += 1
+                found = True
                 break
             i += 1
+        if not found:
+            i = end_max
         boundaries.append((start, i))
+
+    if merge_orphan_tail and len(boundaries) >= 2:
+        last_s, last_e = boundaries[-1]
+        if (last_e - last_s) < min_size:
+            prev_s, prev_e = boundaries[-2]
+            boundaries[-2] = (prev_s, last_e)
+            boundaries.pop()
+
+    assert boundaries[0][0] == 0 and boundaries[-1][1] == n
     return boundaries
+
+# =========================================
+# 固定大小分块
+# =========================================
+def fixed_boundaries(data: bytes, block_size: int = 8192) -> List[Tuple[int, int]]:
+    n = len(data)
+    if n == 0:
+        return []
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    return [(i, min(n, i + block_size)) for i in range(0, n, block_size)]
 
 ###############################################################################
 # Duval Lyndon factorisation and BBWT
@@ -298,46 +387,6 @@ def mtf_decode(seq: List[int]) -> bytes:
         table.pop(idx)
         table.insert(0, b)
     return bytes(out)
-
-###############################################################################
-# Bitwise reversible circuit modules
-###############################################################################
-
-def bitplane_interleave(data: bytes) -> bytes:
-    """Interleave bitplanes of a byte stream.
-
-    For every block of 8 bytes, produce 8 bytes where the first byte
-    contains all the MSBs of the block, the second byte contains all the
-    second MSBs, and so on.  The transform is its own inverse when
-    applied twice.
-    """
-    out = bytearray()
-    it = iter(data)
-    block = list(itertools.islice(it, 8))
-    while block:
-        while len(block) < 8:
-            block.append(0)
-        for bit in range(8):
-            v = 0
-            for i, b in enumerate(block):
-                v |= ((b >> (7 - bit)) & 1) << (7 - i)
-            out.append(v)
-        block = list(itertools.islice(it, 8))
-    return bytes(out)
-
-def bitplane_deinterleave(data: bytes, orig_len: int) -> bytes:
-    out = bytearray()
-    it = iter(data)
-    block = list(itertools.islice(it, 8))
-    while block:
-        for i in range(8):
-            out.append(0)
-        for bit in range(8):
-            byte = block[bit]
-            for i in range(8):
-                out[-8 + i] |= ((byte >> (7 - i)) & 1) << (7 - bit)
-        block = list(itertools.islice(it, 8))
-    return bytes(out[:orig_len])
 
 def lfsr_whiten(data: bytes, taps: int = 0b10010110, seed: int = 1) -> bytes:
     """Whiten data using an 8‑bit LFSR with the given taps and seed.
@@ -820,6 +869,45 @@ def _first_order_bit_entropy(block: bytes) -> float:
             H -= (pxy / total_trans) * math.log2(p_y_given_x)
     return H
 
+###############################################################################
+# Bitwise reversible circuit modules
+###############################################################################
+
+def bitplane_interleave(data: bytes) -> bytes:
+    """Interleave bitplanes of a byte stream.
+
+    For every block of 8 bytes, produce 8 bytes where the first byte
+    contains all the MSBs of the block, the second byte contains all the
+    second MSBs, and so on.  The transform is its own inverse when
+    applied twice.
+    """
+    out = bytearray()
+    it = iter(data)
+    block = list(itertools.islice(it, 8))
+    while block:
+        while len(block) < 8:
+            block.append(0)
+        for bit in range(8):
+            v = 0
+            for i, b in enumerate(block):
+                v |= ((b >> (7 - bit)) & 1) << (7 - i)
+            out.append(v)
+        block = list(itertools.islice(it, 8))
+    return bytes(out)
+
+def bitplane_deinterleave(data: bytes, orig_len: int) -> bytes:
+    out = bytearray()
+    it = iter(data)
+    block = list(itertools.islice(it, 8))
+    while block:
+        for i in range(8):
+            out.append(0)
+        for bit in range(8):
+            byte = block[bit]
+            for i in range(8):
+                out[-8 + i] |= ((byte >> (7 - i)) & 1) << (7 - bit)
+        block = list(itertools.islice(it, 8))
+    return bytes(out[:orig_len])
 
 # === BEGIN V2 helper utilities (inserted above encode_new_pipeline) ===
 def bytes_to_bitplanes(data: bytes) -> Tuple[List[List[int]], int]:
@@ -861,6 +949,7 @@ def bitplanes_to_bytes(planes: List[List[int]]) -> bytes:
               ((planes[6][t] & 1) << 1) | ((planes[7][t] & 1) << 0)
         out[t] = val
     return bytes(out)
+    
 def avg_run_bits(bits: list[int]) -> float:
     if not bits: return 0.0
     runs, prev = 1, bits[0]
@@ -874,6 +963,7 @@ def H0_bits(bits: list[int]) -> float:
     import math
     p = c1/n
     return 0.0 if p==0.0 or p==1.0 else -p*math.log2(p) - (1-p)*math.log2(1-p)
+    
 def rle_binary(bits: list[int]) -> tuple[int, list[int]]:
     if not bits: return (0, [])
     runs=[]; cur=1
@@ -887,13 +977,13 @@ def unrle_binary(first_bit: int, runs: list[int]) -> list[int]:
     for r in runs:
         out.extend([b]*r); b ^= 1
     return out
+    
 def pack_bits_to_bytes(bits: list[int]) -> bytes:
     n=len(bits); out=bytearray((n+7)//8)
     for i,bit in enumerate(bits):
         if bit & 1:
             out[i>>3] |= 1<<(7-(i&7))
     return bytes(out)
-
 def unpack_bits_from_bytes(buf: bytes, nbits: int) -> list[int]:
     out=[0]*nbits
     for i in range(nbits):
@@ -901,183 +991,224 @@ def unpack_bits_from_bytes(buf: bytes, nbits: int) -> list[int]:
     return out
 # === END V2 helper utilities ===
 
+class _BitReader:
+    """Simple bitstream reader over a bytes object."""
+    __slots__ = ("buf", "byte", "bit")  # bit in [0..7], points to next bit to read (MSB-first)
+    def __init__(self, buf: bytes, byte_pos: int = 0, bit_pos: int = 0):
+        self.buf = buf
+        self.byte = byte_pos
+        self.bit  = bit_pos  # 0..7, 0 means next read will take MSB of current byte
 
-def encode_new_pipeline(block: bytes) -> Tuple[bytes, Dict[str, Any]]:
-    """
-    V2 pipeline with circuit_map_automaton + per-plane BBWT + RLE + Rice.
-      - Block bypass on ORIGINAL block.
-      - Apply circuit_map_automaton_forward() to get (mapped, theta={'mode':m})
-      - Split to 8 bitplanes
-      - Per-plane: bypass or BBWT → RLE → Rice
-      - Header: [flag][L][mode][per-plane tags...][payload]
-    """
-    if not block:
-        return bytes([1]), {}
+    def read_bit(self) -> int:
+        if self.byte >= len(self.buf):
+            raise ValueError("BitReader: out of data")
+        b = self.buf[self.byte]
+        v = (b >> (7 - self.bit)) & 1
+        self.bit += 1
+        if self.bit == 8:
+            self.bit = 0
+            self.byte += 1
+        return v
 
-    # Block-level bypass (original block stats)
-    def byte_entropy(b: bytes) -> float:
-        if not b: return 0.0
-        cnt = Counter(b)
-        n = len(b); h = 0.0
-        for v in cnt.values():
-            p = v/n; h -= p*math.log2(p)
-        return h
-    def avg_run_bytes(b: bytes) -> float:
-        if not b: return 0.0
-        runs = 1; prev = b[0]
-        for x in b[1:]:
-            if x != prev: runs += 1; prev = x
-        return len(b)/runs
+    def align_next_byte(self) -> None:
+        if self.bit != 0:
+            self.bit = 0
+            self.byte += 1
 
-    H0 = byte_entropy(block); avgR = avg_run_bytes(block)
-    if H0 >= 7.95 and avgR <= 1.05:
-        return bytes([1]) + block, {}
+    def tell(self) -> tuple[int, int]:
+        return (self.byte, self.bit)
 
-    # circuit automaton (reversible) on bytes
-    mapped, theta = circuit_map_automaton_forward(block)
-    mode = theta.get('mode', 0) & 0xFF
-
-    # Bitplanes
-    planes, L = bytes_to_bitplanes(mapped)
-
-    header = bytearray()
-    payload = bytearray()
-    header.append(0)                 # flag=COMP
-    header += uleb128_encode(L)      # symbols per plane
-    header.append(mode)              # <-- store automaton mode
-
-    for j in range(8):
-        Uj = planes[j]
-        if H0_bits(Uj) >= 0.99 and avg_run_bits(Uj) <= 1.02:
-            header.append(0x00)  # RAW plane
-            packed = pack_bits_to_bytes(Uj)
-            header += uleb128_encode(len(packed))
-            payload += packed
-            continue
-        Lj = bbwt_forward(bytes(Uj))
-        Lj_bits = list(Lj)
-        b1, runs = rle_binary(Lj_bits)
-        mean_r = (sum(runs)/len(runs)) if runs else 1.0
-        k = int(max(0, math.floor(math.log2(mean_r)))) if mean_r>0 else 0
-        rb = rice_encode(runs, k)
-        header.append(0x01)       # BBWT+RLE+Rice
-        header.append(b1 & 1)
-        header.append(k & 0xFF)
-        header += uleb128_encode(len(runs))
-        header += uleb128_encode(len(rb))
-        payload += rb
-
-    return bytes(header) + bytes(payload), {}
-
-def decode_new_pipeline(payload: bytes, orig_len: int, meta: Dict[str, Any]) -> bytes:
-    """
-    Inverse of encode_new_pipeline with circuit_map_automaton.
-    """
-    if not payload:
-        return b""
-    pos = 0
-    flag = payload[pos]; pos += 1
-    if flag == 1:
-        return payload[pos:pos+orig_len]
-
-    L, pos = uleb128_decode_stream(payload, pos)
-    mode = payload[pos]; pos += 1
-
-    descs = []
-    for _ in range(8):
-        tag = payload[pos]; pos += 1
-        if tag == 0x00:
-            nbytes, pos = uleb128_decode_stream(payload, pos)
-            descs.append(('raw', nbytes))
-        elif tag == 0x01:
-            b1 = payload[pos]; k = payload[pos+1]; pos += 2
-            run_count, pos = uleb128_decode_stream(payload, pos)
-            paylen, pos = uleb128_decode_stream(payload, pos)
-            descs.append(('enc', b1, k, run_count, paylen))
-        else:
-            raise ValueError("Unknown plane tag")
-
-    data_pos = pos
-    planes = []
-    for d in descs:
-        if d[0] == 'raw':
-            nbytes = d[1]
-            buf = payload[data_pos:data_pos+nbytes]; data_pos += nbytes
-            Uj = unpack_bits_from_bytes(buf, L)
-            planes.append(Uj)
-        else:
-            _, b1, k, run_count, paylen = d
-            rice_buf = payload[data_pos:data_pos+paylen]; data_pos += paylen
-            runs = rice_decode(rice_buf, k, run_count)
-            if len(runs) != run_count:
-                raise ValueError("run_count mismatch")
-            if sum(runs) != L:
-                raise ValueError("RLE runs sum != plane length L")
-            Lj_bits = unrle_binary(b1, runs)
-            Uj_bytes = bbwt_inverse(bytes(Lj_bits))
-            Uj = list(Uj_bytes)
-            if len(Uj) != L:
-                Uj = Uj[:L] if len(Uj) > L else Uj + [0]*(L-len(Uj))
-            planes.append(Uj)
-
-    # Bitplanes
-    mapped = bitplanes_to_bytes(planes)
-    block = circuit_map_automaton_inverse(mapped, {'mode': mode})
-    return block
-
-
-def nibble_swap(data: bytes) -> bytes:
-    """Swap the high and low 4‑bit nibbles of each byte."""
-    return bytes(((b & 0x0F) << 4) | ((b & 0xF0) >> 4) for b in data)
-
-_BIT_REVERSE_TABLE = bytes(int('{:08b}'.format(i)[::-1], 2) for i in range(256))
-
-def bit_reverse(data: bytes) -> bytes:
-    """Reverse the bit order of each byte using a lookup table."""
-    return bytes(_BIT_REVERSE_TABLE[b] for b in data)
+class _BitWriter:
+    __slots__ = ("buf", "cur", "bitpos")
+    def __init__(self):
+        self.buf = bytearray(); self.cur = 0; self.bitpos = 0  # 0..7, 写到MSB->LSB
+    def write_bit(self, b: int):
+        self.cur |= ( (b & 1) << (7 - self.bitpos) )
+        self.bitpos += 1
+        if self.bitpos == 8:
+            self.buf.append(self.cur); self.cur = 0; self.bitpos = 0
+    def write_unary(self, q: int):
+        for _ in range(q): self.write_bit(1)
+        self.write_bit(0)
+    def write_kbits(self, val: int, k: int):
+        for i in range(k - 1, -1, -1): self.write_bit((val >> i) & 1)
+    def pad_to_byte(self):
+        if self.bitpos: self.buf.append(self.cur); self.cur = 0; self.bitpos = 0
+    def align_next_byte(self):
+        # Alias for symmetry with _BitReader
+        self.pad_to_byte()
+    def getvalue_bits(self):
+        # Return (bytes, bitlen) without padding; we must include partial byte if any
+        bitlen = len(self.buf)*8 + self.bitpos
+        out = bytes(self.buf) + (bytes([self.cur]) if self.bitpos else b'')
+        return out, bitlen
 
 ###############################################################################
 # Integer coders (Rice/Golomb and Elias)
 ###############################################################################
 
-def gamma_encode(n: int) -> bytes:
-    """Elias gamma code for positive integers."""
-    assert n > 0
-    b = n.bit_length()
-    return b'0' * (b - 1) + format(n, f'b').encode('ascii')
+# ---- ZigZag for signed deltas (CDC orig_len around avg) ----
+def _zz_enc(x: int) -> int:
+    return (x << 1) if x >= 0 else ((-x) << 1) - 1
+def _zz_dec(n: int) -> int:
+    return (n >> 1) if (n & 1) == 0 else -((n + 1) >> 1)
 
-def gamma_decode(bitstr: str, pos: int) -> Tuple[int, int]:
-    i = pos
-    while i < len(bitstr) and bitstr[i] == '0':
-        i += 1
-    l = i - pos + 1
-    value = int('1' + bitstr[i + 1 - 1:i + l], 2)
-    return value, i + l
+# ---- Simple canonical Huffman (code lengths + canonical numbering) ----
+class _HuffNode:
+    __slots__ = ('w','sym','left','right')
+    def __init__(self, w, sym=None, left=None, right=None):
+        self.w=w; self.sym=sym; self.left=left; self.right=right
+    def __lt__(self, other):
+        if self.w != other.w: return self.w < other.w
+        # stabilize
+        a = self.sym if self.sym is not None else -1
+        b = other.sym if other.sym is not None else -1
+        return a < b
 
+def _huff_lengths(freq: dict[int,int]) -> dict[int,int]:
+    import heapq
+    heap = []
+    for s,f in freq.items():
+        heap.append(_HuffNode(max(1,f), sym=s))
+    if not heap:
+        return {}
+    if len(heap)==1:
+        return {heap[0].sym: 1}
+    heapq.heapify(heap)
+    while len(heap)>1:
+        a=heapq.heappop(heap); b=heapq.heappop(heap)
+        heapq.heappush(heap, _HuffNode(a.w+b.w, left=a, right=b))
+    # DFS to assign lengths
+    lengths={}
+    stack=[(heap[0],0)]
+    while stack:
+        nd,d=stack.pop()
+        if nd.sym is not None:
+            lengths[nd.sym] = max(1,d)
+        else:
+            stack.append((nd.left, d+1)); stack.append((nd.right, d+1))
+    return lengths
 
+def _huff_canonical(lengths: dict[int,int]):
+    # Returns (enc_tbl: sym->(code,len), dec_tbl: (len,code)->sym, maxlen)
+    items = sorted(lengths.items(), key=lambda kv:(kv[1], kv[0]))
+    enc={}; dec={}
+    code=0; prev=0; maxlen=0
+    for sym,L in items:
+        if L!=prev:
+            code <<= (L-prev); prev=L
+        enc[sym]=(code, L); dec[(L, code)]=sym; maxlen=max(maxlen, L); code+=1
+    return enc, dec, maxlen
 
-def rice_encode(seq: List[int], k: int) -> bytes:
-    """Encode a list of non‑negative integers using Rice coding with parameter 2^k.
+def _huff_encode_symbols(bw: _BitWriter, enc_tbl: dict[int,tuple[int,int]], syms: list[int]):
+    for s in syms:
+        c,L = enc_tbl[s]
+        bw.write_kbits(c, L)
 
-    For k == 0, the code degenerates to pure unary (n = '1'*n + '0'), with
-    no remainder bits. We must not emit any extra '0' here, otherwise the
-    decoder will recover spurious zeros between symbols.
-    """
-    out_bits = []
+def _huff_decode_symbols(br: _BitReader, dec_tbl: dict[tuple[int,int],int], maxlen: int, nvals: int) -> list[int]:
+    out=[]; 
+    for _ in range(nvals):
+        c=0
+        for L in range(1, maxlen+1):
+            c = (c<<1) | br.read_bit()
+            key=(L,c)
+            if key in dec_tbl:
+                out.append(dec_tbl[key]); break
+        else:
+            raise ValueError("Huffman decode failed")
+    return out
+
+# ---- Rice helpers (bit-precise, no padding) ----
+def rice_write_values(bw: _BitWriter, seq: list[int], k: int):
+    M = 1<<k
+    for n in seq:
+        q, r = (n // M, n % M) if k>0 else (n, 0)
+        for _ in range(q): bw.write_bit(1)
+        bw.write_bit(0)
+        if k>0: bw.write_kbits(r, k)
+
+def rice_read_n(br: _BitReader, k: int, nvals: int) -> list[int]:
+    M=1<<k; out=[]
+    for _ in range(nvals):
+        q=0
+        while br.read_bit()==1: q+=1
+        r=0
+        for _ in range(k):
+            r = (r<<1) | br.read_bit()
+        out.append(q*M + r)
+    return out
+
+# ---- Elias–Fano for cumulative payload ends ----
+def _ef_choose_l(U: int, n: int) -> int:
+    if n <= 0 or U <= 1: return 0
+    avg = U // n
+    if avg <= 1: return 0
+    import math
+    return max(0, int(math.floor(math.log2(avg))))
+
+def ef_write_positions(bw: _BitWriter, P: list[int], U: int):
+    n = len(P)
+    l = _ef_choose_l(U, n)
+    # Low bits
+    for x in P:
+        bw.write_kbits(x & ((1<<l)-1), l)
+    # High bitvector B of length m + n with ones at hi_i + i
+    m = (U + ((1<<l)-1)) >> l  # ceil(U/2^l)
+    total = m + n
+    # Build positions
+    pos_bits = [0]*total
+    for i,x in enumerate(P):
+        hi = x >> l
+        idx = hi + i
+        pos_bits[idx] = 1
+    for b in pos_bits:
+        bw.write_bit(b)
+
+def ef_read_positions(br: _BitReader, U: int, n: int) -> list[int]:
+    l = _ef_choose_l(U, n)
+    lows = [0]*n
+    for i in range(n):
+        v=0
+        for _ in range(l):
+            v = (v<<1) | br.read_bit()
+        lows[i]=v
+    m = (U + ((1<<l)-1)) >> l
+    total = m + n
+    ones_pos=[]
+    for idx in range(total):
+        bit = br.read_bit()
+        if bit==1:
+            ones_pos.append(idx)
+            if len(ones_pos)==n:  # early exit if we've got all ones
+                # consume remaining bits if any
+                for _ in range(idx+1, total):
+                    br.read_bit()
+                break
+    # Reconstruct P[i] = ((ones_pos[i]-i) << l) | lows[i]
+    P=[0]*n
+    for i in range(n):
+        hi = ones_pos[i] - i
+        P[i] = (hi << l) | lows[i]
+    return P
+
+# ---- RLE for method ids ----
+def _rle_ids(ids: list[int]) -> tuple[list[int], list[int]]:
+    if not ids: return [], []
+    syms=[ids[0]]; runs=[1]
+    for x in ids[1:]:
+        if x==syms[-1]: runs[-1]+=1
+        else: syms.append(x); runs.append(1)
+    return syms, runs
+
+def rice_encode(seq, k: int) -> bytes:
+    bw = _BitWriter()
     M = 1 << k
     for n in seq:
-        q = n // M
-        r = n % M
-        out_bits.append('1' * q + '0')
-        if k > 0:
-            out_bits.append(format(r, f'0{k}b'))
-    bitstr = ''.join(out_bits)
-    pad = (8 - len(bitstr) % 8) % 8
-    bitstr += '0' * pad
-    out = bytearray()
-    for i in range(0, len(bitstr), 8):
-        out.append(int(bitstr[i:i + 8], 2))
-    return bytes(out)
+        q, r = (n // M, n % M) if k > 0 else (n, 0)
+        bw.write_unary(q)
+        if k > 0: bw.write_kbits(r, k)
+    bw.pad_to_byte()
+    return bytes(bw.buf)
 
 def rice_decode(data: bytes, k: int, nvals: int) -> List[int]:
     bitstr = ''.join(f'{b:08b}' for b in data)
@@ -1110,6 +1241,215 @@ def rice_decode(data: bytes, k: int, nvals: int) -> List[int]:
         out.append(q * M + r)
     return out
 
+def _rice_decode_until_len(br: _BitReader, k: int, target_len: int) -> list[int]:
+    """
+    Decode Rice-coded run lengths from current bit position until sum(runs) == target_len.
+    Unary part is '1'*q + '0'; remainder is k bits (k may be 0).
+    """
+    runs: list[int] = []
+    total = 0
+    M = 1 << k
+    while total < target_len:
+        # read unary q
+        q = 0
+        while True:
+            bit = br.read_bit()  # may raise on truncation
+            if bit == 1:
+                q += 1
+            else:
+                break  # saw the '0' terminator
+        # read remainder r
+        if k == 0:
+            r = 0
+        else:
+            r = 0
+            for _ in range(k):
+                r = (r << 1) | br.read_bit()
+        val = q * M + r
+        if val <= 0:
+            # RLE run must be positive
+            raise ValueError("Invalid Rice value (non-positive)")
+        runs.append(val)
+        total += val
+        if total > target_len:
+            raise ValueError("RLE overrun: sum(runs) > target_len")
+    return runs
+
+
+def _choose_best_rice(runs: list[int]) -> tuple[int, bytes]:
+    """Try k in [0..15], return (best_k, encoded_bytes_with_byte_padding)."""
+    best_k, best_bytes = 0, None
+    for k in range(16):
+        buf = rice_encode(runs, k)  # already byte-padded
+        if best_bytes is None or len(buf) < len(best_bytes):
+            best_k, best_bytes = k, buf
+    return best_k, best_bytes
+
+def encode_new_pipeline(block: bytes) -> Tuple[bytes, Dict[str, Any]]:
+    """
+    V2 pipeline (slim header, NOT backward compatible):
+
+      bytes --circuit_map_automaton--> mapped
+      mapped --split--> 8 bit-planes (MSB-first)
+      per plane: compare RAW vs (BBWT -> RLE -> Rice with optimal k), pick smaller
+      header = [hdr0 | raw_mask | b1_mask | k_list_for_encoded_planes]
+      payload = concat_j RAW_bytes or Rice_bitstream (each plane byte-aligned)
+
+    Notes
+    -----
+    - No internal flag/L/run_count/paylen. Decoder uses container's `orig_len` as L.
+    - After each encoded plane's Rice stream, we pad to the next byte boundary.
+    """
+    if not block:
+        return b"", {}
+
+    # 1) reversible byte-wise circuit (mode autodetected by H0)
+    mapped, theta = circuit_map_automaton_forward(block)
+    mode = int(theta.get("mode", 0)) & 7  # 3 bits are enough
+
+    # 2) split to bit-planes
+    planes, L = bytes_to_bitplanes(mapped)
+    nbytes_plane = (L + 7) // 8
+
+    raw_mask = 0
+    b1_mask  = 0
+    k_bytes: list[int] = []
+    payload_chunks: list[bytes] = []
+
+    for j in range(8):
+        Uj = planes[j]
+        # Build both candidates then pick smaller:
+        # RAW candidate
+        raw_bytes = pack_bits_to_bytes(Uj)
+
+        # ENCODED candidate: BBWT -> RLE -> Rice (best k)
+        Lj = bbwt_forward(bytes(Uj))
+        Lj_bits = list(Lj)
+        b1, runs = rle_binary(Lj_bits)
+        if not runs:
+            # Degenerate: treat as RAW
+            raw_mask |= (1 << j)
+            payload_chunks.append(raw_bytes)
+            continue
+        k_opt, rice_bytes = _choose_best_rice(runs)
+
+        # Compare sizes (count 1 extra byte for k if encoded)
+        if len(raw_bytes) <= len(rice_bytes) + 1:
+            # Choose RAW
+            raw_mask |= (1 << j)
+            payload_chunks.append(raw_bytes)
+        else:
+            # Choose ENCODED
+            # record b1 and k
+            if b1 & 1:
+                b1_mask |= (1 << j)
+            k_bytes.append(k_opt & 0xFF)
+            payload_chunks.append(rice_bytes)
+
+    # 3) header assembly
+    hdr0 = (mode & 0x07) << 5
+    header = bytearray([hdr0, raw_mask & 0xFF, b1_mask & 0xFF])
+    # append k_list in j order for encoded planes
+    enc_iter = iter(k_bytes)
+    # 保证顺序一致：按 j=0..7 只对 encoded 平面写 k
+    #（这里其实不需要回写，因为 k_bytes 已经按生成顺序了；此步仅作自检）
+    # 若更稳妥，可改成：逐平面扫描 raw_mask==0 时从 enc_iter 取一个 k 写入。
+    for j in range(8):
+        if ((raw_mask >> j) & 1) == 0:
+            header.append(next(enc_iter))
+
+    # 4) payload assembly（编码平面已按字节对齐；我们不再跨平面共享比特位）
+    payload = b"".join(payload_chunks)
+
+    return bytes(header) + payload, {}  # meta 无需额外信息
+
+
+# ------------------- REPLACE: decode_new_pipeline (slim header; uses orig_len) -------------------
+
+def decode_new_pipeline(payload: bytes, orig_len: int, meta: Dict[str, Any]) -> bytes:
+    """
+    Inverse of slim-header V2 pipeline.
+
+    Header layout:
+      hdr0(1B):  mode in top 3 bits (mode = hdr0 >> 5)
+      raw_mask:  1B
+      b1_mask:   1B
+      k_list:    1B per encoded plane (in j order, j=0..7)
+
+    Payload layout:
+      For j=0..7:
+        if RAW:     ceil(L/8) bytes of packed bits
+        if ENCODED: Rice bitstream (byte-aligned after finishing this plane)
+    """
+    L = int(orig_len)
+    if L == 0:
+        return b""
+
+    if len(payload) < 3:
+        raise ValueError("V2 slim header truncated")
+
+    pos = 0
+    hdr0 = payload[pos]; pos += 1
+    raw_mask = payload[pos]; pos += 1
+    b1_mask  = payload[pos]; pos += 1
+    mode = (hdr0 >> 5) & 0x07
+
+    # Read k_list (encoded planes only, in j order)
+    k_list: list[int] = []
+    enc_count = 8 - bin(raw_mask).count("1")
+    if pos + enc_count > len(payload):
+        raise ValueError("V2 slim header k_list truncated")
+    for _ in range(enc_count):
+        k_list.append(payload[pos]); pos += 1
+
+    # Prepare to read payload at byte boundary
+    data = payload[pos:]
+    data_pos = 0  # byte index into 'data'
+
+    planes: list[list[int]] = []
+    k_iter = iter(k_list)
+
+    for j in range(8):
+        if ((raw_mask >> j) & 1) == 1:
+            # RAW plane
+            need = (L + 7) // 8
+            if data_pos + need > len(data):
+                raise ValueError("V2 payload truncated in RAW plane")
+            buf = data[data_pos:data_pos + need]; data_pos += need
+            Uj = unpack_bits_from_bytes(buf, L)
+            planes.append(Uj)
+        else:
+            # ENCODED plane: read Rice from current bitpos until sum==L; then align to next byte
+            k = next(k_iter)
+            b1 = (b1_mask >> j) & 1
+            br = _BitReader(data, data_pos, 0)
+            runs = _rice_decode_until_len(br, k, L)
+            # align to next byte for the next plane
+            br.align_next_byte()
+            data_pos, _bit = br.tell()
+            # rebuild plane bits
+            Lj_bits = unrle_binary(b1, runs)
+            Uj_bytes = bbwt_inverse(bytes(Lj_bits))
+            Uj = list(Uj_bytes)
+            if len(Uj) != L:
+                Uj = Uj[:L] if len(Uj) > L else (Uj + [0] * (L - len(Uj)))
+            planes.append(Uj)
+
+    # Recombine planes -> bytes, then invert circuit automaton
+    mapped = bitplanes_to_bytes(planes)
+    block  = circuit_map_automaton_inverse(mapped, {"mode": mode})
+    return block
+
+def nibble_swap(data: bytes) -> bytes:
+    """Swap the high and low 4‑bit nibbles of each byte."""
+    return bytes(((b & 0x0F) << 4) | ((b & 0xF0) >> 4) for b in data)
+
+_BIT_REVERSE_TABLE = bytes(int('{:08b}'.format(i)[::-1], 2) for i in range(256))
+
+def bit_reverse(data: bytes) -> bytes:
+    """Reverse the bit order of each byte using a lookup table."""
+    return bytes(_BIT_REVERSE_TABLE[b] for b in data)
+
 def gray_encode_bytes(data: bytes) -> bytes:
     """Convert each byte into its Gray code: g = x ^ (x >> 1)."""
     return bytes(((b ^ (b >> 1)) & 0xFF) for b in data)
@@ -1132,65 +1472,136 @@ def gray_decode_bytes(data: bytes) -> bytes:
         out.append(n & 0xFF)
     return bytes(out)
 
-###############################################################################
-# Naive LZ77 and Re‑Pair coders
-###############################################################################
+# -----------------------------------------------------------------------------
+# LZ77 (ULEB128) – overlap-safe, 4KiB window, container-compatible
+# -----------------------------------------------------------------------------
+
+def _lz77_match_len_overlap(window: bytearray, block: bytes, pos: int, dist: int, n: int) -> int:
+    """
+    Compute match length allowing overlaps.
+    When matched >= dist, the reference byte comes from the bytes that would
+    have just been produced (i.e., block[pos + matched - dist]).
+    """
+    win_len = len(window)
+    matched = 0
+    while pos + matched < n:
+        if matched < dist:
+            idx = win_len - dist + matched  # reference in existing window
+            if idx >= win_len:  # safety guard; shouldn't happen if dist <= win_len
+                break
+            ref = window[idx]
+        else:
+            src = pos + matched - dist      # overlapping reference
+            if src >= n:
+                break
+            ref = block[src]
+        if ref != block[pos + matched]:
+            break
+        matched += 1
+    return matched
+
 
 def encode_lz77(block: bytes) -> Tuple[bytes, Dict[str, Any]]:
-    """Encode ``block`` using a simplistic LZ77 with ULEB128 coding."""
+    """
+    Encode `block` with a simple LZ77 using ULEB128 for (length, distance).
+    Stream format:
+      - Literal: [0][byte]
+      - Match  : [1][ULEB length][ULEB distance]
+    Window keeps the last 4096 bytes.
+    """
+    WINDOW_MAX = 4096
+    MIN_MATCH  = 3
+
     window = bytearray()
     out = bytearray()
-    pos = 0
     n = len(block)
+    pos = 0
+
     while pos < n:
         best_len = 0
         best_dist = 0
-        # search limited window
-        for dist in range(1, min(len(window), 255) + 1):
-            length = 0
-            while (length < 255 and pos + length < n and
-                   window[-dist + length] == block[pos + length]):
-                length += 1
-            if length > best_len:
-                best_len = length
-                best_dist = dist
-        if best_len >= 3:
-            out.append(1)  # marker for match
+
+        max_window = min(len(window), WINDOW_MAX)
+        if max_window >= 1:
+            # Search near to far (near matches often longer)
+            for dist in range(1, max_window + 1):
+                m = _lz77_match_len_overlap(window, block, pos, dist, n)
+                if m > best_len:
+                    best_len = m
+                    best_dist = dist
+                    # Optional early break if extremely long, e.g., Deflate-style 258
+                    # if best_len >= 258:
+                    #     break
+
+        if best_len >= MIN_MATCH:
+            # Emit match
+            out.append(1)
             out += uleb128_encode(best_len)
             out += uleb128_encode(best_dist)
-            for _ in range(best_len):
-                window.append(block[pos])
-                pos += 1
+            # Advance and push matched bytes into the window
+            window.extend(block[pos:pos + best_len])
+            pos += best_len
         else:
-            out.append(0)  # literal
-            out.append(block[pos])
-            window.append(block[pos])
+            # Emit literal
+            b = block[pos]
+            out.append(0)
+            out.append(b)
+            window.append(b)
             pos += 1
+
+        # Trim window
+        if len(window) > WINDOW_MAX:
+            del window[:-WINDOW_MAX]
+
     return bytes(out), {}
 
 def decode_lz77(data: bytes, orig_len: int) -> bytes:
+    """
+    Decode LZ77 stream produced by `encode_lz77`.
+    Reads 0/1 marker, ULEB128 length/dist, supports overlap copying.
+    Validates final output length.
+    """
+    WINDOW_MAX = 4096
+
     window = bytearray()
     out = bytearray()
-    pos = 0
     i = 0
     n = len(data)
-    while i < n:
+
+    while i < n and len(out) < orig_len:
         flag = data[i]; i += 1
+
         if flag == 0:
+            if i >= n:
+                raise ValueError("LZ77 truncated literal")
             b = data[i]; i += 1
             out.append(b)
             window.append(b)
-        else:
+
+        elif flag == 1:
             length, i = uleb128_decode_stream(data, i)
-            dist, i = uleb128_decode_stream(data, i)
+            dist,   i = uleb128_decode_stream(data, i)
+            if dist == 0:
+                raise ValueError("LZ77 invalid distance 0")
+
+            # Copy with overlap: always read from "window tail - dist"
             for _ in range(length):
+                if dist > len(window):
+                    raise ValueError("LZ77 distance beyond window")
                 b = window[-dist]
                 out.append(b)
                 window.append(b)
-        # keep window manageable
-        if len(window) > 4096:
-            del window[:-4096]
-    assert len(out) == orig_len
+                if len(out) == orig_len:
+                    break
+        else:
+            raise ValueError("LZ77 unknown flag")
+
+        if len(window) > WINDOW_MAX:
+            del window[:-WINDOW_MAX]
+
+    if len(out) != orig_len:
+        raise ValueError("LZ77 output length mismatch")
+
     return bytes(out)
 
 # -----------------------------
@@ -1503,214 +1914,547 @@ def decode_xor(payload: bytes, length: int, meta: Dict[str, Any]) -> bytes:
         prev = b
     return bytes(out)
 
-def compress_blocks(data: bytes, block_size: int = 8192) -> bytes:
-    magic = b'KOLR'
-    boundaries = cdc_fast_boundaries(data, avg_size=block_size)
-    out = bytearray()
-    out += magic
-    out += struct.pack('<I', block_size)
-    out += struct.pack('<I', len(data))
-    out += struct.pack('<H', len(boundaries))
-    # candidate encoders (ordered by increasing cost)
-    # Define candidate models for MDL selection.  V2 removes the invalid
-    # pipelines (BBWT with LFSR mixing) and introduces a new pipeline
-    # ``encode_new_pipeline``.  Each candidate returns a payload and
-    # metadata; the smallest payload is selected for each block.
-    candidates: List[Tuple[ModelEncoder, str]] = [
+
+# =========================================
+# 头字段的模式打包/解包（兼容位）
+# =========================================
+MODE_FIXED = 0  # 固定分块
+MODE_CDC   = 1  # FastCDC
+
+def _pack_mode_and_size(mode: int, size: int) -> int:
+    """
+    用 block_size 字段的最高位作为模式位（1 bit），其余 31bit 写 size：
+    - MODE_FIXED: size = block_size
+    - MODE_CDC  : size = avg_size
+    """
+    if mode not in (MODE_FIXED, MODE_CDC):
+        raise ValueError("invalid mode")
+    if size < 0 or size > 0x7FFFFFFF:
+        raise ValueError("size out of range (must fit in 31 bits)")
+    return ((mode & 1) << 31) | (size & 0x7FFFFFFF)
+
+def _unpack_mode_and_size(word: int) -> Tuple[int, int]:
+    mode = (word >> 31) & 1
+    size = word & 0x7FFFFFFF
+    return mode, size
+
+# Encoders select (ordered by increasing cost)
+# Define candidate models for MDL selection.
+# V2 removes the invalid pipelines (BBWT with LFSR mixing) and introduces a new pipeline ``encode_new_pipeline``.  
+# Each candidate returns a payload and metadata; the smallest payload is selected for each block.
+def _select_encoders() -> List[Tuple[Callable[[bytes], Tuple[bytes, Dict[str, Any]]], str]]:
+    all_list: List[Tuple[Callable[[bytes], Tuple[bytes, Dict[str, Any]]], str]] = [
         (encode_raw, 'raw'),
         (encode_xor, 'xor'),
-        # base BBWT→MTF→Rice (no bitwise module)
         (lambda b: encode_bbwt_mtf_rice(b, False, False, False, False, False, rice_param=2), 'bbwt'),
-        # BBWT with bitplane interleaving
-        (lambda b: encode_bbwt_mtf_rice(b, True, False, False, False, False, rice_param=2), 'bbwt_bp'),
-        # BBWT with nibble swap
-        (lambda b: encode_bbwt_mtf_rice(b, False, False, True, False, False, rice_param=2), 'bbwt_nib'),
-        # BBWT with bit reversal
-        (lambda b: encode_bbwt_mtf_rice(b, False, False, False, True, False, rice_param=2), 'bbwt_br'),
-        # BBWT with Gray code
-        (lambda b: encode_bbwt_mtf_rice(b, False, False, False, False, True, rice_param=2), 'bbwt_gray'),
+        (lambda b: encode_bbwt_mtf_rice(b, True,  False, False, False, False, rice_param=2), 'bbwt_bp'),
+        (lambda b: encode_bbwt_mtf_rice(b, False, False, True,  False, False, rice_param=2), 'bbwt_nib'),
+        (lambda b: encode_bbwt_mtf_rice(b, False, False, False, True,  False, rice_param=2), 'bbwt_br'),
+        (lambda b: encode_bbwt_mtf_rice(b, False, False, False, False, True,  rice_param=2), 'bbwt_gray'),
         (encode_lz77, 'lz77'),
         (encode_lfsr_predict, 'lfsr_pred'),
         (repair_compress, 'repair'),
-        # New V2 pipeline
         (encode_new_pipeline, 'v2_new'),
     ]
-    # mapping from method index to decoder
-    decoders: List[Callable[[bytes, int, Dict[str, Any]], bytes]] = []
-    method_ids: Dict[str, int] = {}
-    # fill decoders after building out, and record method names
-    # we will assign incremental IDs as we append
-    encodings: List[Tuple[int, int, bytes]] = []  # (method_id, orig_len, payload)
-    for start, end in boundaries:
+
+    # 过滤 LZ77
+    if G_NO_LZ77:
+        all_list = [(enc, name) for (enc, name) in all_list if name != 'lz77']
+
+    # 只用某个模型
+    if G_ONLY_METHOD is not None:
+        only = G_ONLY_METHOD.lower()
+        all_list = [(enc, name) for (enc, name) in all_list if name.lower() == only]
+        if not all_list:
+            raise ValueError(f"--only={G_ONLY_METHOD} not found in candidates")
+
+    return all_list
+
+# Decoder select aligned with selected encoders. 
+# Each entry must correspond to the model used during compression.  
+# The order is:
+#   0: raw
+#   1: xor
+#   2: bbwt
+#   3: bbwt+bitplane
+#   4: bbwt+nibble
+#   5: bbwt+bitrev
+#   6: bbwt+gray
+#   7: lz77
+#   8: lfsr predictor
+#   9: re‑pair
+#   10: V2 new pipeline
+def _select_decoders() -> List[Callable[[bytes, int, Dict[str, Any]], bytes]]:
+    return [
+        decode_raw,
+        decode_xor,
+        lambda p, l, meta=None: decode_bbwt_mtf_rice(p, {"flags": 0,  "k": 2, "length": l, "orig_len": l}),
+        lambda p, l, meta=None: decode_bbwt_mtf_rice(p, {"flags": 1,  "k": 2, "length": l, "orig_len": l}),
+        lambda p, l, meta=None: decode_bbwt_mtf_rice(p, {"flags": 4,  "k": 2, "length": l, "orig_len": l}),
+        lambda p, l, meta=None: decode_bbwt_mtf_rice(p, {"flags": 8,  "k": 2, "length": l, "orig_len": l}),
+        lambda p, l, meta=None: decode_bbwt_mtf_rice(p, {"flags": 16, "k": 2, "length": l, "orig_len": l}),
+        lambda p, l, meta=None: decode_lz77(p, l),
+        lambda p, l, meta=None: decode_lfsr_predict(p, l),
+        lambda p, l, meta=None: repair_decompress(p, l),
+        decode_new_pipeline,
+    ]
+
+# =========================================
+# 压缩（CDC 版；头字段含模式位）
+# =========================================
+
+def compress_blocks_cdc(data: bytes, min_size: int = 4096,
+                        avg_size: int = 8192,
+                        max_size: int = 16384) -> bytes:
+    magic = b'KOLR'
+    boundaries = cdc_fast_boundaries_strict(data, min_size, avg_size, max_size)
+    out = bytearray()
+    out += magic
+    out += struct.pack('<I', _pack_mode_and_size(MODE_CDC, avg_size))
+    out += struct.pack('<I', len(data))
+    out += struct.pack('<H', len(boundaries))
+
+    candidates = _select_encoders() if '_select_encoders' in globals() else _select_encoders()
+    method_ids: List[int] = []
+    orig_lens:  List[int] = []
+    payloads:   List[bytes] = []
+    payload_lens: List[int] = []
+    
+    nblocks = len(boundaries)
+    _print_progress("Fast CDC", 0, nblocks)
+
+    for idx, (start, end) in enumerate(boundaries, 1):
         block = data[start:end]
-        best_size = None
-        best_payload = None
-        best_meta = None
-        best_id = None
-        # try each candidate
-        for mid, (encoder, name) in enumerate(candidates):
+        best = (None, None, None)  # (size, payload, mid)
+        for mid, (encoder, _name) in enumerate(candidates):
             try:
-                payload, meta = encoder(block)
+                payload, _meta = encoder(block)
             except Exception:
                 continue
             size = len(payload)
-            if best_size is None or size < best_size:
-                best_size = size
-                best_payload = payload
-                best_meta = meta
-                best_id = mid
-        # record
-        encodings.append((best_id, len(block), best_payload))
-    # write encodings
-    for method_id, orig_len, payload in encodings:
-        out.append(method_id)
-        out += struct.pack('<I', orig_len)
-        out += struct.pack('<I', len(payload))
+            if best[0] is None or size < best[0]:
+                best = (size, payload, mid)
+        if best[1] is None:
+            payload, _ = candidates[0][0](block)
+            mid = 0
+        else:
+            mid = best[2]; payload = best[1]
+        method_ids.append(mid)
+        orig_lens.append(len(block))
+        payloads.append(payload)
+        payload_lens.append(len(payload))
+        _print_progress("Fast CDC COMPRESS", idx, nblocks)
+    _print_progress("FastCDC COMPRESS", nblocks, nblocks, final=True)
+
+    total_payload = sum(payload_lens)
+    # ---- Build TOC header (bytes) ----
+    # RLE + Huffman for method ids
+    run_syms, run_lens = _rle_ids(method_ids)
+    from collections import Counter
+    lengths = _huff_lengths(Counter(run_syms))
+    enc_tbl, dec_tbl, maxlen = _huff_canonical(lengths)
+    # Choose Rice k for run lengths (0..7) by brute force on bytes length with our bitwriter (approx by bits)
+    best_k = 0; best_bits = 1<<60
+    for k in range(8):
+        bw_tmp = _BitWriter(); rice_write_values(bw_tmp, run_lens, k)
+        _bytes, bits = bw_tmp.getvalue_bits()
+        if bits < best_bits: best_bits = bits; best_k = k
+
+    # CDC orig len scheme
+    MODE = MODE_CDC
+
+    toc_header = bytearray()
+    # n_runs
+    toc_header += uleb128_encode(len(run_syms))
+    # codebook size K and (sym, length) pairs in canonical order
+    K = len(enc_tbl)
+    toc_header += uleb128_encode(K)
+    for sym, L in sorted(lengths.items(), key=lambda kv:(kv[1], kv[0])):
+        toc_header += uleb128_encode(sym)
+        toc_header += uleb128_encode(L)
+    # rice k for runs
+    toc_header += uleb128_encode(best_k)
+    if MODE == MODE_FIXED:
+        # store only last block orig len
+        last_len = orig_lens[-1] if nblocks>0 else 0
+        toc_header += uleb128_encode(last_len)
+    else:
+        # CDC: ZigZag + Rice (choose k)
+        # compute deltas
+        avg_size = avg_size
+        deltas = [_zz_enc(ol - avg_size) for ol in orig_lens]
+        best_k2 = 0; best_bits2 = 1<<60
+        for k in range(8):
+            bw_tmp = _BitWriter(); rice_write_values(bw_tmp, deltas, k)
+            _bytes, bits = bw_tmp.getvalue_bits()
+            if bits < best_bits2: best_bits2 = bits; best_k2 = k
+        toc_header += uleb128_encode(best_k2)
+
+    # ---- Build TOC bitstream ----
+    bw = _BitWriter()
+    # method ids (runs) via Huffman
+    _huff_encode_symbols(bw, enc_tbl, run_syms)
+    # run lengths via Rice(best_k)
+    rice_write_values(bw, run_lens, best_k)
+    if MODE == MODE_CDC:
+        # deltas via Rice(best_k2)
+        rice_write_values(bw, deltas, best_k2)
+    # payload cumulative ends via Elias–Fano
+    P=[]; s=0
+    for L in payload_lens:
+        s += L; P.append(s)
+    ef_write_positions(bw, P, total_payload)
+    toc_bits, toc_bitlen = bw.getvalue_bits()
+
+    # Write toc_hdr_len, toc_bitlen, total_payload
+    out += uleb128_encode(len(toc_header))
+    out += uleb128_encode(toc_bitlen)
+    out += uleb128_encode(total_payload)
+
+    # Append TOC header and TOC bits, then payloads
+    out += toc_header
+    out += toc_bits
+    for payload in payloads:
         out += payload
     return bytes(out)
 
-def decompress(data: bytes) -> bytes:
+# =========================================
+# 压缩（固定分块；头字段含模式位）
+# =========================================
+
+def compress_blocks_fixed(data: bytes, block_size: int = 8192) -> bytes:
+    magic = b'KOLR'
+    boundaries = fixed_boundaries(data, block_size)
+    out = bytearray()
+    out += magic
+    out += struct.pack('<I', _pack_mode_and_size(MODE_FIXED, block_size))
+    out += struct.pack('<I', len(data))
+    out += struct.pack('<H', len(boundaries))
+
+    candidates = _select_encoders() if '_select_encoders' in globals() else _select_encoders()
+    method_ids: List[int] = []
+    orig_lens:  List[int] = []
+    payloads:   List[bytes] = []
+    payload_lens: List[int] = []
+    
+    nblocks = len(boundaries)
+    _print_progress("FIXED", 0, nblocks)
+
+    for idx, (start, end) in enumerate(boundaries, 1):
+        block = data[start:end]
+        best = (None, None, None)  # (size, payload, mid)
+        for mid, (encoder, _name) in enumerate(candidates):
+            try:
+                payload, _meta = encoder(block)
+            except Exception:
+                continue
+            size = len(payload)
+            if best[0] is None or size < best[0]:
+                best = (size, payload, mid)
+        if best[1] is None:
+            payload, _ = candidates[0][0](block)
+            mid = 0
+        else:
+            mid = best[2]; payload = best[1]
+        method_ids.append(mid)
+        orig_lens.append(len(block))
+        payloads.append(payload)
+        payload_lens.append(len(payload))
+        
+        # 进度更新
+        _print_progress("FIXED COMPRESS", idx, nblocks)
+    _print_progress("FIXED COMPRESS", nblocks, nblocks, final=True)
+
+    total_payload = sum(payload_lens)
+    # ---- Build TOC header (bytes) ----
+    # RLE + Huffman for method ids
+    run_syms, run_lens = _rle_ids(method_ids)
+    from collections import Counter
+    lengths = _huff_lengths(Counter(run_syms))
+    enc_tbl, dec_tbl, maxlen = _huff_canonical(lengths)
+    # Choose Rice k for run lengths (0..7) by brute force on bytes length with our bitwriter (approx by bits)
+    best_k = 0; best_bits = 1<<60
+    for k in range(8):
+        bw_tmp = _BitWriter(); rice_write_values(bw_tmp, run_lens, k)
+        _bytes, bits = bw_tmp.getvalue_bits()
+        if bits < best_bits: best_bits = bits; best_k = k
+
+    # CDC orig len scheme
+    MODE = MODE_FIXED
+
+    toc_header = bytearray()
+    # n_runs
+    toc_header += uleb128_encode(len(run_syms))
+    # codebook size K and (sym, length) pairs in canonical order
+    K = len(enc_tbl)
+    toc_header += uleb128_encode(K)
+    for sym, L in sorted(lengths.items(), key=lambda kv:(kv[1], kv[0])):
+        toc_header += uleb128_encode(sym)
+        toc_header += uleb128_encode(L)
+    # rice k for runs
+    toc_header += uleb128_encode(best_k)
+    if MODE == MODE_FIXED:
+        # store only last block orig len
+        last_len = orig_lens[-1] if nblocks>0 else 0
+        toc_header += uleb128_encode(last_len)
+    else:
+        # CDC: ZigZag + Rice (choose k)
+        # compute deltas
+        avg_size = avg_size
+        deltas = [_zz_enc(ol - avg_size) for ol in orig_lens]
+        best_k2 = 0; best_bits2 = 1<<60
+        for k in range(8):
+            bw_tmp = _BitWriter(); rice_write_values(bw_tmp, deltas, k)
+            _bytes, bits = bw_tmp.getvalue_bits()
+            if bits < best_bits2: best_bits2 = bits; best_k2 = k
+        toc_header += uleb128_encode(best_k2)
+
+    # ---- Build TOC bitstream ----
+    bw = _BitWriter()
+    # method ids (runs) via Huffman
+    _huff_encode_symbols(bw, enc_tbl, run_syms)
+    # run lengths via Rice(best_k)
+    rice_write_values(bw, run_lens, best_k)
+    if MODE == MODE_CDC:
+        # deltas via Rice(best_k2)
+        rice_write_values(bw, deltas, best_k2)
+    # payload cumulative ends via Elias–Fano
+    P=[]; s=0
+    for L in payload_lens:
+        s += L; P.append(s)
+    ef_write_positions(bw, P, total_payload)
+    toc_bits, toc_bitlen = bw.getvalue_bits()
+
+    # Write toc_hdr_len, toc_bitlen, total_payload
+    out += uleb128_encode(len(toc_header))
+    out += uleb128_encode(toc_bitlen)
+    out += uleb128_encode(total_payload)
+
+    # Append TOC header and TOC bits, then payloads
+    out += toc_header
+    out += toc_bits
+    for payload in payloads:
+        out += payload
+    return bytes(out)
+
+# =========================================
+# 解压（兼容旧容器；可读取模式位）
+# =========================================
+
+def decompress(container: bytes) -> bytes:
     pos = 0
-    if data[:4] != b'KOLR':
+    if len(container) < 4 or container[:4] != b'KOLR':
         raise ValueError('Invalid magic')
     pos = 4
-    block_size = struct.unpack_from('<I', data, pos)[0]; pos += 4
-    total_len = struct.unpack_from('<I', data, pos)[0]; pos += 4
-    nblocks = struct.unpack_from('<H', data, pos)[0]; pos += 2
-    # Decoder list aligned with candidate encoders.  Each entry must
-    # correspond to the model used during compression.  The order is:
-    #   0: raw
-    #   1: xor
-    #   2: bbwt
-    #   3: bbwt+bitplane
-    #   4: bbwt+nibble
-    #   5: bbwt+bitrev
-    #   6: bbwt+gray
-    #   7: lz77
-    #   8: lfsr predictor
-    #   9: re‑pair
-    #   10: V2 new pipeline
-    decoders: List[Callable[[bytes, int, Dict[str, Any]], bytes]] = [
-        decode_raw,
-        decode_xor,
-        # bbwt base (flags 0)
-        lambda p,l,meta=None: decode_bbwt_mtf_rice(p, {"flags":0,"k":2,"length":l,"orig_len":l}),
-        # bbwt + bitplane (flags 1)
-        lambda p,l,meta=None: decode_bbwt_mtf_rice(p, {"flags":1,"k":2,"length":l,"orig_len":l}),
-        # bbwt + nibble swap (flags 4)
-        lambda p,l,meta=None: decode_bbwt_mtf_rice(p, {"flags":4,"k":2,"length":l,"orig_len":l}),
-        # bbwt + bit reverse (flags 8)
-        lambda p,l,meta=None: decode_bbwt_mtf_rice(p, {"flags":8,"k":2,"length":l,"orig_len":l}),
-        # bbwt + gray code (flags 16)
-        lambda p,l,meta=None: decode_bbwt_mtf_rice(p, {"flags":16,"k":2,"length":l,"orig_len":l}),
-        lambda p,l,meta=None: decode_lz77(p, l),
-        lambda p,l,meta=None: decode_lfsr_predict(p, l),
-        lambda p,l,meta=None: repair_decompress(p, l),
-        decode_new_pipeline,
-    ]
+    packed = struct.unpack_from('<I', container, pos)[0]; pos += 4
+    mode, size_field = _unpack_mode_and_size(packed)
+    total_len  = struct.unpack_from('<I', container, pos)[0]; pos += 4
+    nblocks    = struct.unpack_from('<H', container, pos)[0]; pos += 2
+
+    # New format: toc header length (bytes), toc_bitlen (bits), total_payload (bytes)
+    toc_hdr_len, pos = uleb128_decode_stream(container, pos)
+    toc_bitlen, pos  = uleb128_decode_stream(container, pos)
+    total_payload, pos = uleb128_decode_stream(container, pos)
+
+    # Read TOC header and bitstream
+    if pos + toc_hdr_len > len(container):
+        raise ValueError("Truncated TOC header")
+    toc_header = container[pos:pos+toc_hdr_len]; pos += toc_hdr_len
+    toc_bit_bytes = (toc_bitlen + 7) // 8
+    if pos + toc_bit_bytes > len(container):
+        raise ValueError("Truncated TOC bits")
+    toc_bits = container[pos:pos+toc_bit_bytes]; pos += toc_bit_bytes
+
+    # Parse TOC header (byte-level fields)
+    p = 0
+    n_runs, p = uleb128_decode_stream(toc_header, p)
+    K, p = uleb128_decode_stream(toc_header, p)
+    lengths = {}
+    for _ in range(K):
+        sym, p = uleb128_decode_stream(toc_header, p)
+        L, p   = uleb128_decode_stream(toc_header, p)
+        lengths[sym] = L
+    k_runs, p = uleb128_decode_stream(toc_header, p)
+
+    if mode == MODE_FIXED:
+        last_orig_len, p = uleb128_decode_stream(toc_header, p)
+    else:
+        k_orig, p = uleb128_decode_stream(toc_header, p)
+
+    # Decode TOC bitstreams
+    enc_tbl, dec_tbl, maxlen = _huff_canonical(lengths)
+    br = _BitReader(toc_bits, 0, 0)
+    run_syms = _huff_decode_symbols(br, dec_tbl, maxlen, n_runs)
+    run_lens = rice_read_n(br, k_runs, n_runs)
+
+    # Expand method_ids
+    method_ids = []
+    for s, r in zip(run_syms, run_lens):
+        method_ids.extend([s]*r)
+    if len(method_ids) != nblocks:
+        raise ValueError("Method id RLE expands to wrong size")
+
+    # orig_lens
+    if mode == MODE_FIXED:
+        block_size = size_field & 0x7FFFFFFF
+        orig_lens = [block_size]*(nblocks-1) + ([last_orig_len] if nblocks>0 else [])
+    else:
+        avg_size = size_field & 0x7FFFFFFF
+        deltas = rice_read_n(br, k_orig, nblocks)
+        orig_lens = [avg_size + _zz_dec(x) for x in deltas]
+
+    # payload cumulative ends via Elias–Fano
+    P = ef_read_positions(br, total_payload, nblocks)
+    if P and P[-1] != total_payload:
+        raise ValueError("Payload EF sum mismatch")
+
+    # Now read payload area
+    if pos + total_payload > len(container):
+        raise ValueError("Truncated payload area")
+    data_payload = container[pos:pos+total_payload]; pos += total_payload
+
+    # Slice per block and decode
+    decoders = _select_decoders() if '_select_decoders' in globals() else _candidate_decoders()
     out = bytearray()
-    for _ in range(nblocks):
-        method_id = data[pos]; pos += 1
-        orig_len = struct.unpack_from('<I', data, pos)[0]; pos += 4
-        payload_len = struct.unpack_from('<I', data, pos)[0]; pos += 4
-        payload = data[pos:pos + payload_len]; pos += payload_len
-        block = decoders[method_id](payload, orig_len, {})
+    start = 0
+    
+    _print_progress("DECOMPRESS", 0, nblocks)
+    
+    for i in range(nblocks):
+        pay_end = P[i]
+        pay_len = pay_end - start
+        payload = data_payload[start:pay_end]
+        start = pay_end
+        mid = method_ids[i]
+        orig_len = orig_lens[i]
+        if mid < 0 or mid >= len(decoders):
+            raise ValueError(f'Unknown method_id {mid}')
+        block = decoders[mid](payload, orig_len, {})
         out += block
-    assert len(out) == total_len
+        
+        _print_progress("DECOMPRESS", i + 1, nblocks)
+    _print_progress("DECOMPRESS", nblocks, nblocks, final=True)
+
+    if len(out) != total_len:
+        raise ValueError(f'Length mismatch: got {len(out)}, expect {total_len}')
+    if pos != len(container):
+        # allow trailing zeros? be strict:
+        raise ValueError(f'Extra trailing {len(container)-pos} bytes after container end')
     return bytes(out)
+
 
 ###############################################################################
 # Built‑in experiment: compare models
 ###############################################################################
 
 def run_experiment() -> None:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import numpy as np
-    # Prepare datasets: text, random, repetitive
-    text = (
-        "In a hole in the ground there lived a hobbit. Not a nasty, dirty, wet "
-        "hole, filled with the ends of worms and an oozy smell, nor yet a dry, "
-        "bare, sandy hole with nothing in it to sit down on or to eat: it was a "
-        "hobbit‑hole, and that means comfort."
-    ).encode('utf-8') * 10
-    random_bytes = bytes(random.getrandbits(8) for _ in range(10240))
-    repetitive = b'a' * 20480
+    """跑一组内置数据集，按当前候选表评估体积比；优先画图，缺依赖则打印表格。"""
     datasets = {
-        'text': text,
-        'random': random_bytes,
-        'repetitive': repetitive,
+        'text': (
+            "In a hole in the ground there lived a hobbit. Not a nasty, dirty, wet "
+            "hole, filled with the ends of worms and an oozy smell, nor yet a dry, "
+            "bare, sandy hole with nothing in it to sit down on or to eat: it was a "
+            "hobbit-hole, and that means comfort."
+        ).encode('utf-8') * 10,
+        'random': bytes(random.getrandbits(8) for _ in range(10240)),
+        'repetitive': b'a' * 20480,
     }
-    # candidate names aligned with decoders index ordering above
-    # Model names aligned with the candidate list in V2.  We remove
-    # invalid BBWT+LFSR variants and add the new V2 pipeline.
-    names = [
-        'Raw', 'XOR', 'BBWT', 'BBWT+Bitplane',
-        'BBWT+Nibble', 'BBWT+BitRev', 'BBWT+Gray',
-        'LZ77', 'LFSR predictor', 'Re‑Pair', 'V2 New'
-    ]
-    # Map names to encoder functions (order matches decoders).  Note
-    # that ``encode_bbwt_mtf_rice`` expects flags; we omit LFSR and
-    # bitplane+LFSR combinations.
-    encoders = [
-        encode_raw,
-        encode_xor,
-        lambda b: encode_bbwt_mtf_rice(b, False, False, False, False, False),
-        lambda b: encode_bbwt_mtf_rice(b, True, False, False, False, False),
-        lambda b: encode_bbwt_mtf_rice(b, False, False, True, False, False),
-        lambda b: encode_bbwt_mtf_rice(b, False, False, False, True, False),
-        lambda b: encode_bbwt_mtf_rice(b, False, False, False, False, True),
-        encode_lz77,
-        encode_lfsr_predict,
-        repair_compress,
-        encode_new_pipeline,
-    ]
+
+    encoders = _select_encoders()  # [(enc, name), ...] 已考虑 --no-lz77 / --only
+    names = [name for _, name in encoders]
+
     ratios: Dict[str, List[float]] = {ds: [] for ds in datasets}
     for ds_name, data in datasets.items():
-        for enc in encoders:
+        for enc, enc_name in encoders:
             try:
-                payload, meta = enc(data)
+                payload, _meta = enc(data)
                 size = len(payload)
-            except Exception:
+            except Exception as e:
+                # 出错时把比率记为 1.0（视同原样）；同时给出简短提示
                 size = len(data)
-            ratio = size / len(data) if len(data) else 1.0
-            ratios[ds_name].append(ratio)
-    # plot as grouped bar chart with English labels to avoid font issues
-    fig, ax = plt.subplots(figsize=(10, 6))
-    x = np.arange(len(datasets))
-    bar_width = 0.08
-    for i, name in enumerate(names):
-        vals = [ratios[ds][i] for ds in datasets]
-        ax.bar(x + i * bar_width, vals, bar_width, label=name)
-    ax.set_xticks(x + bar_width * (len(names) - 1) / 2)
-    ax.set_xticklabels(list(datasets.keys()))
-    ax.set_ylabel('Compressed size / Original size')
-    ax.set_title('Model compression ratios across datasets (lower is better)')
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.savefig('./kolm_researched_v2_ratios.png')
-    print('Experiment completed, plot saved to kolm_researched_v2_ratios.png')
+                print(f"[warn] encoder '{_name}' on '{ds_name}' raised: {e}")
+            ratios[ds_name].append(size / len(data) if len(data) else 1.0)
+
+    # 优先画图；如果 matplotlib/numpy 不在环境里，则退化为表格输出
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        fig, ax = plt.subplots(figsize=(max(8, 1.2*len(names)), 6))
+        x = np.arange(len(datasets))
+        bar_width = 0.8 / max(1, len(names))
+        for i, name in enumerate(names):
+            vals = [ratios[ds][i] for ds in datasets]
+            ax.bar(x + i * bar_width, vals, bar_width, label=name)
+        ax.set_xticks(x + bar_width * (len(names) - 1) / 2)
+        ax.set_xticklabels(list(datasets.keys()))
+        ax.set_ylabel('Compressed size / Original size (lower is better)')
+        ax.set_title('Model compression ratios across datasets')
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        plt.tight_layout()
+        outpng = './kolm_researched_v2_ratios.png'
+        plt.savefig(outpng)
+        print(f'Experiment completed, plot saved to {outpng}')
+    except Exception:
+        # 退化：打印等宽表格
+        colw = max(len(n) for n in names + ["model"])
+        print("\n== Experiment (text / random / repetitive) ==")
+        header = f"{'model'.ljust(colw)}  {'text':>8}  {'random':>8}  {'repetitive':>11}"
+        print(header)
+        print('-' * len(header))
+        for i, name in enumerate(names):
+            t = ratios['text'][i]
+            r = ratios['random'][i]
+            rep = ratios['repetitive'][i]
+            print(f"{name.ljust(colw)}  {t:8.3f}  {r:8.3f}  {rep:11.3f}")
 
 ###############################################################################
 # CLI
 ###############################################################################
 
 if __name__ == '__main__':
-    import argparse, sys, os
+    import argparse, sys, os, random  # random 供 run_experiment 使用
     parser = argparse.ArgumentParser(description='Kolmogorov researched compressor')
-    parser.add_argument('input', nargs='?', help='Input file to compress or decompress')
+
+    parser.add_argument('-i', '--input', nargs='?', help='Input file to compress or decompress')
     parser.add_argument('-d', '--decompress', action='store_true', help='Decompress')
     parser.add_argument('-o', '--output', help='Output file')
-    parser.add_argument('-b', '--block', type=int, default=8192, help='Target block size')
-    parser.add_argument('--experiment', action='store_true', help='Run built‑in experiment')
+
+    # 统一块参数：固定模式下为固定块大小；FastCDC 模式下作为 avg_size 使用
+    parser.add_argument('-b', '--block', type=int, default=2048,
+                        help='Target block size (FIXED) or avg_size (FastCDC)')
+
+    # FastCDC 模式开关（大小写都支持）
+    parser.add_argument('--FastCDC', '--fastcdc', dest='fastcdc', action='store_true', help='Use Fast Content-Defined Chunking (avg_size = --block). When off, use fixed-size chunking.')
+
+    # 实验开关保留
+    parser.add_argument('--experiment', action='store_true', help='Run built-in experiment')
+
+    parser.add_argument('--no-lz77', action='store_true',
+                        help='Disable LZ77 candidate (affects selection and experiment)')
+    parser.add_argument('--only', type=str, default=None,
+                        help='Only use a single model by name (e.g. v2_new, lz77, raw)')
+
+    parser.add_argument('--progress', action='store_true',
+                    help='Show per-block progress like C++')
+
     args = parser.parse_args()
+
+    # 设置全局开关（放在最后一次 parse_args() 之后）
+    G_NO_LZ77   = bool(args.no_lz77)
+    G_ONLY_METHOD = args.only
+    G_PROGRESS  = bool(args.progress)
+
     if args.experiment:
         run_experiment()
         sys.exit(0)
+
     if not args.input:
         parser.print_help()
         sys.exit(0)
+
     if args.decompress:
         data = open(args.input, 'rb').read()
         out = decompress(data)
@@ -1720,9 +2464,22 @@ if __name__ == '__main__':
         print(f'Decompressed {len(data)} bytes to {len(out)} bytes → {outname}')
     else:
         data = open(args.input, 'rb').read()
-        blob = compress_blocks(data, block_size=args.block)
+
+        if args.fastcdc:
+            # 由 --block 作为 avg_size；自动派生 min/max，确保 0 < min ≤ avg ≤ max
+            avg = max(64, args.block)
+            min_size = max(64, min(avg, avg // 2 if avg >= 2 else 64))
+            max_size = max(avg, avg * 2)
+
+            blob = compress_blocks_cdc(data, min_size=min_size, avg_size=avg, max_size=max_size)
+            mode_desc = f'FastCDC(min={min_size}, avg={avg}, max={max_size})'
+        else:
+            blob = compress_blocks_fixed(data, block_size=args.block)
+            mode_desc = f'FIXED(block={args.block})'
+
         outname = args.output or (args.input + '.kolr')
         with open(outname, 'wb') as f:
             f.write(blob)
+
         ratio = len(blob) / len(data) if len(data) else 1.0
-        print(f'Compressed {len(data)} bytes to {len(blob)} bytes (ratio {ratio:.3f}) → {outname}')
+        print(f'[{mode_desc}] Compressed {len(data)} bytes to {len(blob)} bytes (ratio {ratio:.3f}) → {outname}')
