@@ -3,7 +3,7 @@
 //
 // This translation of the original Python module implements a prototype
 // compressor/decompressor that follows the “boolean‑circuit first, probability
-// last” philosophy.  The code is written in ISO C++20 using only the
+// last” philosophy.  The code is written in ISO C++20 using only the
 // standard library.  Each function corresponds closely to its Python
 // counterpart with clear variable names and detailed comments explaining the
 // algorithmic intent.  Care has been taken to avoid arithmetic overflow by
@@ -11,45 +11,67 @@
 // transformations are lossless and reversible; when paired with the
 // appropriate decoder they reconstruct the original data exactly.
 
+// -----------------------------
+// Core C / fundamental types
+// -----------------------------
 #include <cassert>
-#include <algorithm>
-#include <array>
-#include <bitset>
 #include <cstdint>
 #include <cmath>
 #include <cstring>
-#include <functional>
-#include <iostream>
 #include <limits>
-#include <map>
-#include <numeric>
-#include <optional>
-#include <random>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <sstream>
-#include <memory>
+
+// -----------------------------
+// C++ language utilities / type traits
+// -----------------------------
+#include <bit>            // C++20: std::bit_width
 #include <tuple>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
-#include <vector>
-#include <mutex>
-#include <span>
-#include <filesystem>
 
-// NOTE: EF bitstream I/O function declarations are placed *after* BitWriter/BitReader definitions.
-// or timing and formatted output in run_self_test.  These
-// headers provide std::chrono for wall‑clock measurements and std::setw,
-// std::setprecision, etc. for nicely formatted tables.
-#include <bit>		// for std::bit_width (if used from linked units)
+// -----------------------------
+// Containers & associative types
+// -----------------------------
+#include <array>
+#include <bitset>
+#include <map>
+#include <queue>
+#include <unordered_map>
+#include <vector>
+
+// -----------------------------
+// Memory / optional / views
+// -----------------------------
+#include <memory>
+#include <optional>
+#include <span>
+
+// -----------------------------
+// Algorithms / numerics / functionals
+// -----------------------------
+#include <algorithm>
+#include <functional>
+#include <numeric>
+#include <random>
+
+// -----------------------------
+// I/O, formatting, and stream utilities
+// -----------------------------
 #include <chrono>
 #include <iomanip>
-#include <queue>
-#include <sstream>	// for std::ostringstream in toc_brief()
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <string_view>
 
-using ByteSpan = std::span<const std::uint8_t>;
+// -----------------------------
+// Filesystem
+// -----------------------------
+#include <filesystem>
+
+// -----------------------------
+// Error handling / exceptions / misc
+// -----------------------------
+#include <stdexcept>
 
 // --no-lz77
 static bool G_NO_LZ77 = false;
@@ -85,6 +107,17 @@ void clear_only()
 // MODE_CDC   = 1  # FastCDC
 constexpr std::uint32_t MODE_FIXED = 0;
 constexpr std::uint32_t MODE_CDC = 1;
+
+const std::array<std::vector<std::uint8_t>, 256> k_term_cache = []() {
+	std::array<std::vector<std::uint8_t>, 256> arr;
+	for ( int t = 0; t < 256; ++t )
+	{
+		arr[ t ] = std::vector<std::uint8_t> { static_cast<std::uint8_t>( t ) };
+	}
+	return arr;
+}();
+
+using ByteSpan = std::span<const std::uint8_t>;
 
 // Forward declarations for functions defined later in the file.  The
 // compressor uses a wide variety of helper routines and data structures
@@ -1442,6 +1475,55 @@ std::vector<std::uint8_t> mode4_inverse( const std::vector<std::uint8_t>& residu
 	return out;
 }
 
+// Select the best reversible automaton by minimum 0th‑order entropy.  Modes
+// considered: identity (0), mode1, mode2, mode3, mode4.  Ties favour
+// smaller mode index to ensure deterministic behaviour.  Returns both
+// transformed data and the chosen mode identifier.
+AutomatonResult circuit_map_automaton_forward( const std::vector<std::uint8_t>& block )
+{
+	double					  best_entropy = zero_order_entropy( block );
+	std::uint8_t			  best_mode = 0;
+	std::vector<std::uint8_t> best_bytes = block;
+	// Candidates for modes 1..4.
+	std::vector<std::pair<std::uint8_t, std::vector<std::uint8_t>>> candidates;
+	candidates.emplace_back( 1, mode1_forward( block ) );
+	candidates.emplace_back( 2, mode2_forward( block ) );
+	candidates.emplace_back( 3, mode3_forward( block ) );
+	candidates.emplace_back( 4, mode4_forward( block ) );
+	for ( const auto& [ mode_id, mapped ] : candidates )
+	{
+		double ent = zero_order_entropy( mapped );
+		if ( ent < best_entropy - 1e-9 || ( std::abs( ent - best_entropy ) <= 1e-9 && mode_id < best_mode ) )
+		{
+			best_entropy = ent;
+			best_mode = mode_id;
+			best_bytes = mapped;
+		}
+	}
+	return { best_bytes, best_mode };
+}
+
+// Inverse of the selected automaton.  Given the mode id, dispatch to the
+// appropriate inverse function.  Unknown modes fall back to identity.
+std::vector<std::uint8_t> circuit_map_automaton_inverse( const std::vector<std::uint8_t>& mapped, std::uint8_t mode )
+{
+	switch ( mode )
+	{
+	case 0:
+		return mapped;
+	case 1:
+		return mode1_inverse( mapped );
+	case 2:
+		return mode2_inverse( mapped );
+	case 3:
+		return mode3_inverse( mapped );
+	case 4:
+		return mode4_inverse( mapped );
+	default:
+		return mapped;
+	}
+}
+
 // Approximate first‑order (Markov) bit entropy function removed in V2.
 // The V2 pipeline does not rely on entropy heuristics when selecting
 // transforms.  The implementation of first_order_bit_entropy is retained
@@ -1494,6 +1576,50 @@ double first_order_bit_entropy( const std::vector<std::uint8_t>& block )
 }
 #endif
 
+// Average run length for a binary sequence.  Count number of runs and divide
+// length by run count.
+double avg_run_bits( const std::vector<int>& bits )
+{
+#if 0
+	// Legacy implementation retained for reference.  Computes the average run
+	// length of a binary sequence by counting transitions.
+	if ( bits.empty() )
+		return 0.0;
+	std::size_t runs = 1;
+	int prev = bits[ 0 ];
+	for ( std::size_t i = 1; i < bits.size(); ++i )
+	{
+		if ( bits[ i ] != prev )
+		{
+			runs++;
+			prev = bits[ i ];
+		}
+	}
+	return static_cast<double>( bits.size() ) / runs;
+#endif
+	(void)bits; // suppress unused parameter warning in active builds
+	return 0.0;
+}
+
+// 0th‑order entropy of a binary sequence.  Uses natural log base 2.
+double H0_bits( const std::vector<int>& bits )
+{
+#if 0
+	// Legacy implementation retained for reference.  Computes the zero‑order
+	// binary entropy (base‑2) using the proportion of ones.
+	if ( bits.empty() )
+		return 0.0;
+	std::size_t n = bits.size();
+	std::size_t c1 = std::count( bits.begin(), bits.end(), 1 );
+	double p = static_cast<double>( c1 ) / static_cast<double>( n );
+	if ( p == 0.0 || p == 1.0 )
+		return 0.0;
+	return -p * std::log2( p ) - ( 1.0 - p ) * std::log2( 1.0 - p );
+#endif
+	(void)bits; // suppress unused parameter warning in active builds
+	return 0.0;
+}
+
 // Compute 0th‑order entropy of a byte array.  Used by the automaton selector.
 double zero_order_entropy( const std::vector<std::uint8_t>& data )
 {
@@ -1512,55 +1638,6 @@ double zero_order_entropy( const std::vector<std::uint8_t>& data )
 		h -= p * std::log2( p );
 	}
 	return h;
-}
-
-// Select the best reversible automaton by minimum 0th‑order entropy.  Modes
-// considered: identity (0), mode1, mode2, mode3, mode4.  Ties favour
-// smaller mode index to ensure deterministic behaviour.  Returns both
-// transformed data and the chosen mode identifier.
-AutomatonResult circuit_map_automaton_forward( const std::vector<std::uint8_t>& block )
-{
-	double					  best_entropy = zero_order_entropy( block );
-	std::uint8_t			  best_mode = 0;
-	std::vector<std::uint8_t> best_bytes = block;
-	// Candidates for modes 1..4.
-	std::vector<std::pair<std::uint8_t, std::vector<std::uint8_t>>> candidates;
-	candidates.emplace_back( 1, mode1_forward( block ) );
-	candidates.emplace_back( 2, mode2_forward( block ) );
-	candidates.emplace_back( 3, mode3_forward( block ) );
-	candidates.emplace_back( 4, mode4_forward( block ) );
-	for ( const auto& [ mode_id, mapped ] : candidates )
-	{
-		double ent = zero_order_entropy( mapped );
-		if ( ent < best_entropy - 1e-9 || ( std::abs( ent - best_entropy ) <= 1e-9 && mode_id < best_mode ) )
-		{
-			best_entropy = ent;
-			best_mode = mode_id;
-			best_bytes = mapped;
-		}
-	}
-	return { best_bytes, best_mode };
-}
-
-// Inverse of the selected automaton.  Given the mode id, dispatch to the
-// appropriate inverse function.  Unknown modes fall back to identity.
-std::vector<std::uint8_t> circuit_map_automaton_inverse( const std::vector<std::uint8_t>& mapped, std::uint8_t mode )
-{
-	switch ( mode )
-	{
-	case 0:
-		return mapped;
-	case 1:
-		return mode1_inverse( mapped );
-	case 2:
-		return mode2_inverse( mapped );
-	case 3:
-		return mode3_inverse( mapped );
-	case 4:
-		return mode4_inverse( mapped );
-	default:
-		return mapped;
-	}
 }
 
 // Split bytes -> 8 MSB-first bit-planes.
@@ -1605,50 +1682,6 @@ std::vector<std::uint8_t> bitplanes_to_bytes( const std::vector<std::vector<int>
 		out[ t ] = val;
 	}
 	return out;
-}
-
-// Average run length for a binary sequence.  Count number of runs and divide
-// length by run count.
-double avg_run_bits( const std::vector<int>& bits )
-{
-#if 0
-	// Legacy implementation retained for reference.  Computes the average run
-	// length of a binary sequence by counting transitions.
-	if ( bits.empty() )
-		return 0.0;
-	std::size_t runs = 1;
-	int prev = bits[ 0 ];
-	for ( std::size_t i = 1; i < bits.size(); ++i )
-	{
-		if ( bits[ i ] != prev )
-		{
-			runs++;
-			prev = bits[ i ];
-		}
-	}
-	return static_cast<double>( bits.size() ) / runs;
-#endif
-	(void)bits; // suppress unused parameter warning in active builds
-	return 0.0;
-}
-
-// 0th‑order entropy of a binary sequence.  Uses natural log base 2.
-double H0_bits( const std::vector<int>& bits )
-{
-#if 0
-	// Legacy implementation retained for reference.  Computes the zero‑order
-	// binary entropy (base‑2) using the proportion of ones.
-	if ( bits.empty() )
-		return 0.0;
-	std::size_t n = bits.size();
-	std::size_t c1 = std::count( bits.begin(), bits.end(), 1 );
-	double p = static_cast<double>( c1 ) / static_cast<double>( n );
-	if ( p == 0.0 || p == 1.0 )
-		return 0.0;
-	return -p * std::log2( p ) - ( 1.0 - p ) * std::log2( 1.0 - p );
-#endif
-	(void)bits; // suppress unused parameter warning in active builds
-	return 0.0;
 }
 
 // Run‑length encode a binary sequence: returns first bit and a list of run
@@ -2060,36 +2093,30 @@ inline std::pair<std::vector<int>, int> replace_non_overlapping( const std::vect
 }
 
 // 递归+记忆化展开：与 Re-Pair SLP 定义一致（A -> XY），稳定可逆
-static const std::vector<std::uint8_t>& expand_symbol( int sym, const std::unordered_map<int, std::pair<int, int>>& rules, std::unordered_map<int, std::vector<std::uint8_t>>& memo )
+static const std::vector<std::uint8_t>& expand_symbol( int symbol, const std::unordered_map<int, std::pair<int, int>>& rules, std::unordered_map<int, std::vector<std::uint8_t>>& memories )
 {
-	if ( sym < 256 )
+	if ( symbol < 256 )
 	{
-		static std::array<std::vector<std::uint8_t>, 256> term_cache {};
-		static std::once_flag							  once;
-		std::call_once( once, [] {
-			for ( int t = 0; t < 256; ++t )
-				term_cache[ t ] = std::vector<std::uint8_t> { static_cast<std::uint8_t>( t ) };
-		} );
-		return term_cache[ sym ];
+		return k_term_cache[symbol];
 	}
-	auto it = memo.find( sym );
-	if ( it != memo.end() )
+	auto it = memories.find( symbol );
+	if ( it != memories.end() )
 		return it->second;
 
-	auto r = rules.find( sym );
+	auto r = rules.find( symbol );
 	if ( r == rules.end() )
 	{
 		throw std::runtime_error( "RePair: nonterminal without rule" );
 	}
-	const auto& left = expand_symbol( r->second.first, rules, memo );
-	const auto& right = expand_symbol( r->second.second, rules, memo );
+	const auto& left = expand_symbol( r->second.first, rules, memories );
+	const auto& right = expand_symbol( r->second.second, rules, memories );
 
 	std::vector<std::uint8_t> buf;
 	buf.reserve( left.size() + right.size() );
 	buf.insert( buf.end(), left.begin(), left.end() );
 	buf.insert( buf.end(), right.begin(), right.end() );
 
-	auto [ ins, _ ] = memo.emplace( sym, std::move( buf ) );
+	auto [ ins, _ ] = memories.emplace( symbol, std::move( buf ) );
 	return ins->second;
 }
 
@@ -4287,7 +4314,8 @@ namespace SelfTest
 							   "bare, sandy hole with nothing in it to sit down on or to eat: it was a "
 							   "hobbit-hole, and that means comfort.";
 			std::string repeated;
-			for (int i=0;i<10;++i) repeated += para;
+			for (int i=0;i<10;++i)
+				repeated += para;
 			datasets.push_back({"text", std::vector<std::uint8_t>(repeated.begin(), repeated.end())});
 		}
 		{
@@ -4296,37 +4324,53 @@ namespace SelfTest
 							   "bare, sandy hole with nothing in it to sit down on or to eat: it was a "
 							   "hobbit-hole, and that means comfort.";
 			std::string repeated;
-			for (int i=0;i<200;++i) repeated += para;
+			for (int i=0;i<200;++i)
+				repeated += para;
 			datasets.push_back({"text_big", std::vector<std::uint8_t>(repeated.begin(), repeated.end())});
 		}
 		{
-			std::vector<std::uint8_t> rnd(10240);
-			std::mt19937 rng(123456789);
-			std::uniform_int_distribution<int> dist(0,255);
-			for (auto& b : rnd) b = static_cast<std::uint8_t>(dist(rng));
-			datasets.push_back({"random", std::move(rnd)});
+			std::vector<std::uint8_t>		   rnd( 10240 );
+			std::mt19937					   rng( 123456789 );
+			std::uniform_int_distribution<int> dist( 0, 255 );
+			for ( auto& b : rnd )
+				b = static_cast<std::uint8_t>( dist( rng ) );
+			datasets.push_back( { "random", std::move( rnd ) } );
 		}
-		datasets.push_back({"repetitive", std::vector<std::uint8_t>(20480, (std::uint8_t)'a')});
+		datasets.push_back( { "repetitive", std::vector<std::uint8_t>( 20480, ( std::uint8_t )'a' ) } );
 		{
-			std::vector<std::uint8_t> v; v.reserve(20000);
-			for (int i=0;i<10000;++i){ v.push_back('a'); v.push_back('b'); }
-			datasets.push_back({"abab", std::move(v)});
+			std::vector<std::uint8_t> v;
+			v.reserve( 20000 );
+			for ( int i = 0; i < 10000; ++i )
+			{
+				v.push_back( 'a' );
+				v.push_back( 'b' );
+			}
+			datasets.push_back( { "abab", std::move( v ) } );
 		}
 		{
-			std::vector<std::uint8_t> v; v.reserve(18000);
-			for (int i=0;i<6000;++i){ v.push_back('a'); v.push_back('b'); v.push_back('c'); }
-			datasets.push_back({"abcabc", std::move(v)});
+			std::vector<std::uint8_t> v;
+			v.reserve( 18000 );
+			for ( int i = 0; i < 6000; ++i )
+			{
+				v.push_back( 'a' );
+				v.push_back( 'b' );
+				v.push_back( 'c' );
+			}
+			datasets.push_back( { "abcabc", std::move( v ) } );
 		}
-		datasets.push_back({"zero", std::vector<std::uint8_t>(16384, 0)});
+		datasets.push_back( { "zero", std::vector<std::uint8_t>( 16384, 0 ) } );
 		{
-			std::vector<std::uint8_t> v(8192);
-			for (std::size_t i=0;i<v.size();++i) v[i] = static_cast<std::uint8_t>(i & 0xFF);
-			datasets.push_back({"ramp", std::move(v)});
+			std::vector<std::uint8_t> v( 8192 );
+			for ( std::size_t i = 0; i < v.size(); ++i )
+				v[ i ] = static_cast<std::uint8_t>( i & 0xFF );
+			datasets.push_back( { "ramp", std::move( v ) } );
 		}
 		{
 			std::string s = "数据压缩 data compression 可逆性 reversibility —— Kolmogorov-style.";
-			std::string rep; for (int i=0;i<200;++i) rep += s;
-			datasets.push_back({"utf8_mixed", std::vector<std::uint8_t>(rep.begin(), rep.end())});
+			std::string rep;
+			for ( int i = 0; i < 200; ++i )
+				rep += s;
+			datasets.push_back( { "utf8_mixed", std::vector<std::uint8_t>( rep.begin(), rep.end() ) } );
 		}
 
 		const std::vector<std::string> mode_names = {"FIXED","FastCDC"};
@@ -4339,7 +4383,7 @@ namespace SelfTest
 			double ratio = 0.0;
 			double comp_ms = 0.0;
 			double decomp_ms = 0.0;
-			std::string ok = "OK";
+			std::string result_string = "PASS";
 			ByteVector blob; // 用于后续表B/表C解析
 		};
 		std::vector<Row> rows; rows.reserve(datasets.size()*2);
@@ -4359,7 +4403,8 @@ namespace SelfTest
 			r.mode = use_cdc ? mode_names[1] : mode_names[0];
 			r.orig_size = ds.data.size();
 
-			try {
+			try
+			{
 				auto t0 = clock::now();
 				ByteVector blob = use_cdc ? compress_blocks_cdc(ds.data, min_size, avg, max_size)
 										  : compress_blocks_fixed(ds.data, fixed_block);
@@ -4374,21 +4419,39 @@ namespace SelfTest
 				ByteVector rec = decompress(blob);
 				t1 = clock::now();
 				r.decomp_ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()/1000.0;
-				if (rec != ds.data) r.ok = "FAIL";
+				if (rec != ds.data) 
+					r.result_string = "FAIL";
 
 				r.blob = std::move(blob);
-			} catch (const std::exception& e) {
-				r.ok = "ERR";
+			}
+			catch (const std::system_error& e)
+			{
+				r.result_string = "EXCEPT";
 				r.ratio = std::numeric_limits<double>::infinity();
+				const auto ec = e.code();
+				std::cerr << "[SelfTest] SYSTEM_ERROR: " << "\n";
+				std::cerr << "What=" << e.what() << "\n";
+				std::cerr << "CodeValue=" << ec.value() << "\n";
+				std::cerr << "CodeCategoryName=" << ec.category().name() << "\n";
+				std::cerr << "CodeMessage=" << ec.message() << "\n";
+			}
+			catch (const std::exception& e)
+			{
+				r.result_string = "EXCEPT";
+				r.ratio = std::numeric_limits<double>::infinity();
+				std::cerr << "[SelfTest] Type=" << typeid(e).name() << "\n";
 				std::cerr << "[SelfTest] FATAL: " << e.what() << "\n";
-			} catch (...) {
-				r.ok = "ERR";
+			}
+			catch (...)
+			{
+				r.result_string = "ERROR";
 				r.ratio = std::numeric_limits<double>::infinity();
 				std::cerr << "[SelfTest] FATAL: unknown exception\n";
 			}
 
 			// 更新best
-			if (r.ok=="OK" && r.ratio < best_of[r.dataset].ratio) {
+			if (r.result_string=="PASS" && r.ratio < best_of[r.dataset].ratio)
+			{
 				best_of[r.dataset] = {r.ratio, r.mode, r.blob_size, r.comp_ms, r.decomp_ms};
 			}
 
@@ -4408,19 +4471,19 @@ namespace SelfTest
 				  << std::right<< std::setw(12) << "Unfolded"
 				  << std::setw(12) << "Folded"
 				  << std::setw(8)  << "Ratio"
-				  << std::setw(14) << "Compress(ms)"
-				  << std::setw(14) << "Decomp(ms)"
-				  << std::setw(8)  << "OK/ERR" << "\n";
-		std::cout << std::string(90,'-') << "\n";
+				  << std::setw(16) << "Compress (ms)"
+				  << std::setw(16) << "Decompress (ms)"
+				  << std::setw(16)  << "PASS/ERROR" << "\n";
+		std::cout << std::string(120,'-') << "\n";
 		for (const auto& r : rows) {
 			std::cout << std::left  << std::setw(12) << r.dataset
 					  << std::left  << std::setw(10) << r.mode
 					  << std::right << std::setw(12) << r.orig_size
 					  << std::setw(12) << r.blob_size
 					  << std::setw(8)  << std::fixed << std::setprecision(3) << r.ratio
-					  << std::setw(14) << std::fixed << std::setprecision(3) << r.comp_ms
-					  << std::setw(14) << std::fixed << std::setprecision(3) << r.decomp_ms
-					  << std::setw(8)  << r.ok << "\n";
+					  << std::setw(16) << std::fixed << std::setprecision(3) << r.comp_ms
+					  << std::setw(16) << std::fixed << std::setprecision(3) << r.decomp_ms
+					  << std::setw(16)  << r.result_string << "\n";
 		}
 
 		// =========================
@@ -4431,77 +4494,87 @@ namespace SelfTest
 				  << std::left << std::setw(10) << "Mode"
 				  << std::left << std::setw(16) << "Container"
 				  << std::right<< std::setw(8)  << "Blocks"
-				  << std::setw(10) << "TOC_hdrB"
-				  << std::setw(10) << "TOC_bits"
-				  << std::setw(12) << "PayloadB"
+				  << std::setw(14) << "TOC_headrB"
+				  << std::setw(14) << "TOC_bits"
+				  << std::setw(14) << "PayloadB"
 				  << "\n";
 		std::cout << std::string(88,'-') << "\n";
-		for (const auto& r : rows) {
-			std::string cbrief = "-";
+		for ( const auto& r : rows )
+		{
+			std::string	  cbrief = "-";
 			std::uint32_t blocks = 0;
-			std::uint64_t hdrB=0, bits=0, pay=0;
+			std::uint64_t headrB = 0, bits = 0, pay = 0;
 
-			if (!r.blob.empty()) {
-				if (auto tb = get_toc_brief(r.blob)) {
+			if ( !r.blob.empty() )
+			{
+				if ( auto tb = get_toc_brief( r.blob ) )
+				{
 					std::ostringstream oss;
-					oss << (tb->is_cdc ? "CDC(" : "FIXED(") << "size=" << tb->size31 << ")";
+					oss << ( tb->is_cdc ? "CDC(" : "FIXED(" ) << "size=" << tb->size31 << ")";
 					cbrief = oss.str();
-					blocks = tb->nblocks; hdrB = tb->toc_hdr_len; bits = tb->toc_bitlen; pay = tb->total_payload;
-				} else {
+					blocks = tb->nblocks;
+					headrB = tb->toc_hdr_len;
+					bits = tb->toc_bitlen;
+					pay = tb->total_payload;
+				}
+				else
+				{
 					// 兜底：用 summarize_container_methods 的字符串（不拆字段）
-					cbrief = summarize_container_methods(r.blob);
+					cbrief = summarize_container_methods( r.blob );
 				}
 			}
 
-			std::cout << std::left  << std::setw(12) << r.dataset
-					  << std::left  << std::setw(10) << r.mode
-					  << std::left  << std::setw(16) << cbrief
-					  << std::right << std::setw(8)  << blocks
-					  << std::setw(10) << hdrB
-					  << std::setw(10) << bits
-					  << std::setw(12) << pay
-					  << "\n";
+			std::cout << std::left << std::setw( 12 ) << r.dataset 
+				<< std::left << std::setw( 10 ) << r.mode 
+				<< std::left << std::setw( 16 ) << cbrief << std::right << std::setw( 8 ) 
+				<< blocks << std::setw( 14 ) 
+				<< headrB << std::setw( 14 ) 
+				<< bits << std::setw( 14 ) << pay << "\n";
 		}
 
 		// =========================
 		// 表C：方法直方图（来自 parse_container_blocks）
 		// =========================
 		std::cout << "\n";
-		std::cout << std::left << std::setw(12) << "Dataset"
-				  << std::left << std::setw(10) << "Mode"
-				  << std::left << std::setw(48) << "Methods(histogram)"
+		std::cout << std::left << std::setw( 12 ) << "Dataset" << std::left << std::setw( 10 ) << "Mode" << std::left << std::setw( 48 ) << "Methods(histogram)"
 				  << "\n";
-		std::cout << std::string(72,'-') << "\n";
-		for (const auto& r : rows) {
+		std::cout << std::string( 72, '-' ) << "\n";
+		for ( const auto& r : rows )
+		{
 			std::string hist = "-";
-			try {
-				if (!r.blob.empty()) {
-					hist = format_model_histogram(parse_container_blocks(r.blob));
+			try
+			{
+				if ( !r.blob.empty() )
+				{
+					hist = format_model_histogram( parse_container_blocks( r.blob ) );
 				}
-			} catch (...) {
+			}
+			catch ( ... )
+			{
 				hist = "parse-error";
 			}
-			if (hist.size() > 46) { // 控制列宽
-				hist.resize(46);
+			if ( hist.size() > 46 )
+			{  // 控制列宽
+				hist.resize( 46 );
 				hist += "…";
 			}
-			std::cout << std::left << std::setw(12) << r.dataset
-					  << std::left << std::setw(10) << r.mode
-					  << std::left << std::setw(48) << hist
-					  << "\n";
+			std::cout << std::left << std::setw( 12 ) 
+				<< r.dataset << std::left << std::setw( 10 )
+				<< r.mode << std::left << std::setw( 48 ) 
+				<< hist << "\n";
 		}
 
 		// （可选）保留原先“best of”结尾总结
 		std::cout << "\nBest mode per dataset (by ratio):\n";
-		for (const auto& kv : best_of) {
+		for ( const auto& kv : best_of )
+		{
 			const auto& b = kv.second;
-			std::cout << "  " << std::left << std::setw(12) << kv.first
-					  << " -> " << std::left << std::setw(10) << b.mode
-					  << " size=" << b.size
-					  << " ratio=" << std::fixed << std::setprecision(3) << b.ratio
-					  << " comp(ms)=" << std::fixed << std::setprecision(3) << b.c
-					  << " decomp(ms)=" << std::fixed << std::setprecision(3) << b.d
-					  << "\n";
+			std::cout << "  " << std::left << std::setw( 12 ) 
+				<< kv.first << " -> " << std::left << std::setw( 10 ) 
+				<< b.mode << " size=" << b.size 
+				<< " ratio=" << std::fixed << std::setprecision( 3 ) 
+				<< b.ratio << " comp(ms)=" << std::fixed << std::setprecision( 3 ) 
+				<< b.c << " decomp(ms)=" << std::fixed << std::setprecision( 3 ) << b.d << "\n";
 		}
 	}
 
