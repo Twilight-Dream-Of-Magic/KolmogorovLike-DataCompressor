@@ -82,10 +82,11 @@ under an MDL-driven per-block selection strategy.
 from __future__ import annotations
 import itertools
 from collections import Counter
+from dataclasses import dataclass
 import math
 import struct
 import random
-from typing import List, Tuple, Dict, Callable, Optional, Any
+from typing import List, Tuple, Dict, Callable, Optional, Any, Union
 
 # 全局开关（CLI 会设置）
 G_NO_LZ77: bool = False
@@ -136,16 +137,22 @@ def uleb128_decode_stream(data: bytes, pos: int = 0) -> Tuple[int, int]:
         shift += 7
 
 ###############################################################################
-# FastCDC content‑defined chunking
+# FastCDC content-defined chunking
+#
+# Paper reference:
+#   Wen Xia et al. "Design of Fast Content-Defined Chunking for
+#   Data Deduplication-Based Storage Systems", IEEE TPDS, 2020.
 ###############################################################################
 
+from typing import List, Tuple
+
 # =========================================
-# 确定性的 GEAR 表（固定种子，跨平台可复现）
+# Deterministic GEAR table (fixed seed)
 # =========================================
 def _make_gear(seed: int = 0x243F6A88) -> List[int]:
     """
-    生成 256 项 32-bit gear 表，基于 xorshift32 的确定性序列。
-    为避免出现 0 值，最后与 1 做 OR。
+    Generate a 256-entry 32-bit GEAR table using xorshift32.
+    Bits are OR'ed with 1 to avoid zero entries.
     """
     x = seed & 0xFFFFFFFF
     tbl: List[int] = []
@@ -160,55 +167,137 @@ def _make_gear(seed: int = 0x243F6A88) -> List[int]:
 _GEAR: List[int] = _make_gear()
 
 # =========================================
-# FastCDC（严格、非递归）
+# Helpers
 # =========================================
 def _clamp_mask_bits(avg_size: int) -> int:
+    """
+    Map average chunk size to mask bit count k, such that
+    the boundary probability is roughly 1 / 2^k.
+    The value is clamped into [6, 20] as in the FastCDC paper.
+    """
     if avg_size <= 0:
         return 6
-    k = (avg_size).bit_length() - 1
-    if k < 6:  k = 6
-    if k > 20: k = 20
+    k = avg_size.bit_length() - 1
+    if k < 6:
+        k = 6
+    if k > 20:
+        k = 20
     return k
 
 def _roll_gear(h: int, byte_val: int) -> int:
+    """
+    One-step GEAR-based rolling hash:
+        fp' = (fp << 1) + GEAR[byte]
+    using 32-bit arithmetic (mod 2^32).
+    """
     return ((h << 1) & 0xFFFFFFFF) + _GEAR[byte_val]
 
+def _make_low_mask(bits: int) -> int:
+    """
+    Build a contiguous low-bit mask with `bits` ones:
+        bits = 3 -> mask = 0b111
+    """
+    if bits <= 0:
+        return 0
+    if bits >= 32:
+        return 0xFFFFFFFF
+    return (1 << bits) - 1
+
+# =========================================
+# FastCDC (strict, non-recursive, with
+# normalized chunking as in Algorithm 2)
+# =========================================
 def cdc_fast_boundaries_strict(data: bytes,
                                min_size: int = 4096,
                                avg_size: int = 8192,
                                max_size: int = 16384,
                                merge_orphan_tail: bool = True) -> List[Tuple[int, int]]:
+    """
+    FastCDC-style content-defined chunking with normalized chunking:
+    - The region [min_size, NormalSize) uses a stronger mask (MaskS)
+      to suppress very small chunks.
+    - The region [NormalSize, max_size] uses a looser mask (MaskL)
+      to avoid oversized chunks.
+    - NormalSize is generalized from the paper's 8KB target to avg_size.
+    """
     n = len(data)
     if n == 0:
         return []
-    if not (min_size > 0 and min_size <= avg_size <= max_size):
-        raise ValueError("Require 0 < min_size ≤ avg_size ≤ max_size")
-    if avg_size < 64:
-        raise ValueError("avg_size too small; use ≥ 64")
 
+    if not (min_size > 0 and min_size <= avg_size <= max_size):
+        raise ValueError("Require 0 < min_size <= avg_size <= max_size")
+    if avg_size < 64:
+        raise ValueError("avg_size too small; use >= 64")
+
+    # Base mask bits from avg_size
     k = _clamp_mask_bits(avg_size)
-    mask = (1 << k) - 1
+    # Stronger and looser masks for normalized chunking
+    k_str = k + 2 if (k + 2) <= 20 else 20
+    k_lo  = k - 2 if k > 2 else 1
+
+    mask_a = _make_low_mask(k)      # baseline mask (not used directly)
+    mask_s = _make_low_mask(k_str)  # MaskS: before NormalSize
+    mask_l = _make_low_mask(k_lo)   # MaskL: after NormalSize
+
+    _ = mask_a  # keep for completeness; not used explicitly in NC mode
 
     boundaries: List[Tuple[int, int]] = []
     i = 0
+
     while i < n:
         start = i
-        end_min = min(n, start + min_size)
-        end_max = min(n, start + max_size)
-        i = end_min
-        h = 0
+        remaining = n - start
+
+        # If the remaining data is shorter than or equal to min_size,
+        # emit the final chunk directly.
+        if remaining <= min_size:
+            boundaries.append((start, n))
+            i = n
+            break
+
+        # Local maximum length for this chunk
+        local_max = min(remaining, max_size)
+
+        # NormalSize: generalized from the paper's fixed 8KB to avg_size
+        normal_size = avg_size
+        if local_max < normal_size:
+            normal_size = local_max
+
+        end_min    = start + min_size           # no cut before this
+        end_normal = start + normal_size        # upper bound for MaskS region
+        end_limit  = start + local_max          # hard upper bound
+
+        pos = end_min
+        fp = 0
         found = False
-        while i < end_max:
-            h = _roll_gear(h, data[i])
-            if (h & mask) == 0:
-                i += 1
+
+        # Phase 1: [min_size, NormalSize) using MaskS
+        while pos < end_normal and pos < end_limit:
+            fp = _roll_gear(fp, data[pos])
+            if (fp & mask_s) == 0:
+                pos += 1
                 found = True
                 break
-            i += 1
-        if not found:
-            i = end_max
-        boundaries.append((start, i))
+            pos += 1
 
+        # Phase 2: [NormalSize, max_size] using MaskL
+        if not found:
+            while pos < end_limit:
+                fp = _roll_gear(fp, data[pos])
+                if (fp & mask_l) == 0:
+                    pos += 1
+                    found = True
+                    break
+                pos += 1
+
+        # If no boundary is found, cut at local_max
+        if not found:
+            pos = end_limit
+
+        boundaries.append((start, pos))
+        i = pos
+
+    # Optional: merge an orphan tail that is smaller than min_size
     if merge_orphan_tail and len(boundaries) >= 2:
         last_s, last_e = boundaries[-1]
         if (last_e - last_s) < min_size:
@@ -450,424 +539,559 @@ Engineering notes
   parallel scan; `left_band` is a convenience band operator built from it.
 """
 
-###############################################################################
-# Boolean gate primitives (word/byte) + prefix/band + 2:1 MUX (pure gates)
-###############################################################################
-from typing import Tuple, Dict
+# ------------------------------- Boolean circuit gates and primitives  -------------------------------
 
+from dataclasses import dataclass
+from math import log2
+from typing import List, Tuple, Dict, Any, Optional, Union
+
+# -------- helpers: byte clamp / masks --------
+
+def _mask_n(width: int) -> int:
+    width = 0 if width < 0 else (8 if width > 8 else width)
+    return 0 if width == 0 else ((1 << width) - 1)
+
+def _b(x: int) -> int:
+    """Clamp to 8-bit unsigned."""
+    return x & 0xFF
+
+# -------- gates (data-path only) --------
 
 def gate_and(a: int, b: int) -> int:
-    """Bitwise AND (pure Boolean gate)."""
-    return a & b
-
+    return _b(a & b)
 
 def gate_or(a: int, b: int) -> int:
-    """Bitwise OR (pure Boolean gate)."""
-    return a | b
+    return _b(a | b)
 
+def gate_not(a: int, width: int) -> int:
+    """NOT limited to bit-width, keep only lowest `width` bits (two's complement semantics)."""
+    lane_mask = _mask_n(width)
+    return _b((~a) & lane_mask)
 
-def gate_not(a: int, width: int = 8) -> int:
-    """Bitwise NOT limited to *width* bits via masking.
+def gate_xor(a: int, b: int, width: int) -> int:
+    """XOR via OR/AND/NOT with lane-masking: XOR = (a OR b) AND NOT(a AND b)."""
+    or_result  = gate_or(a, b)
+    and_result = gate_and(a, b)
+    not_and    = gate_not(and_result, width)
+    return _b(or_result & not_and)
 
-    Parameters
-    ----------
-    a : int
-        Input word.
-    width : int, default 8
-        Active bit-lane width. Only the lowest `width` bits are kept.
+def byte_equal_mask(a: int, b: int) -> int:
+    """Branch-free byte equality: 0xFF if a==b else 0x00."""
+    x = gate_xor(a, b, 8)
+    x |= (x >> 4)
+    x |= (x >> 2)
+    x |= (x >> 1)
+    any_bit1    = x & 1
+    equal_bit1  = gate_not(any_bit1, 1)     # 1-bit lane: 1 if equal
+    # spread 1-bit to 0xFF
+    equal_bit1 |= (equal_bit1 << 1)
+    equal_bit1 |= (equal_bit1 << 2)
+    equal_bit1 |= (equal_bit1 << 4)
+    return _b(equal_bit1)
 
-    Returns
-    -------
-    int
-        Bitwise complement of `a` in the selected lane.
+def mux_mask(mask_ff: int, a: int, b: int) -> int:
+    """2:1 byte-wise mux: pick from a where mask bit=1 else from b."""
+    return _b((a & mask_ff) | (b & gate_not(mask_ff, 8)))
+
+def gray_code(v: int, width: int) -> int:
+    return gate_xor(v, (v >> 1), width)
+
+def gate_majority_3(a: int, b: int, c: int) -> int:
+    ab  = gate_and(a, b)
+    ac  = gate_and(a, c)
+    bc  = gate_and(b, c)
+    abc = gate_or(ab, ac)
+    return gate_or(abc, bc)
+
+# ---- morphology (all gates) ----
+
+def spread_left1(x: int) -> int:
+    return _b(((x << 1) & 0xFE) | x)
+
+def spread_right1(x: int) -> int:
+    return _b(((x >> 1) & 0x7F) | x)
+
+def dilate1(x: int) -> int:
+    return _b(spread_left1(x) | spread_right1(x))
+
+def erode1(x: int) -> int:
+    return _b(~dilate1(_b(~x)) & 0xFF)
+
+def close1(x: int) -> int:
+    return erode1(dilate1(x))
+
+def open1(x: int) -> int:
+    return dilate1(erode1(x))
+
+def edge1(x: int) -> int:
+    return _b(dilate1(x) ^ erode1(x))
+
+# -------- zero-order entropy (bits/byte) --------
+
+def zero_order_entropy_bits_per_byte(data: bytes) -> float:
+    if not data:
+        return 0.0
+    freq = [0] * 256
+    for v in data:
+        freq[v] += 1
+    n = float(len(data))
+    H = 0.0
+    for f in freq:
+        if f:
+            p = f / n
+            H -= p * log2(p)
+    return H  # bits/symbol == bits/byte (8-bit alphabet)
+
+# =========================================
+# Model interface and concrete models
+# =========================================
+
+@dataclass
+class TransformChoice:
+    transform_bytes: bytes
+    H0_bits_per_byte: float
+    model_code: int          # 0..5
+    param_code: int          # e.g., k / variant / mask
+    model_name: str
+
+class IBooleanCircuitModel:
+    def name(self) -> str: ...
+    def forward(self, raw: bytes, param_code: int) -> bytes: ...
+    def backward(self, residual: bytes, param_code: int) -> bytes: ...
+
+# ---- Model 1: Delta-k ----
+
+class ModelDeltaK(IBooleanCircuitModel):
+    def name(self) -> str:
+        return "Model-1: Delta-k"
+
+    def forward(self, raw: bytes, param_k: int) -> bytes:
+        if param_k == 0:
+            return raw
+        n = len(raw)
+        if n == 0:
+            return b""
+        out = bytearray(n)
+        for i in range(n):
+            out[i] = raw[i] if i < param_k else gate_xor(raw[i], raw[i - param_k], 8)
+        return bytes(out)
+
+    def backward(self, residual: bytes, param_k: int) -> bytes:
+        if param_k == 0:
+            return residual
+        n = len(residual)
+        if n == 0:
+            return b""
+        raw = bytearray(n)
+        for i in range(n):
+            raw[i] = residual[i] if i < param_k else gate_xor(residual[i], raw[i - param_k], 8)
+        return bytes(raw)
+
+# ---- Model 2: Gray family ----
+
+class GrayVariant:
+    G1 = 0
+    G2 = 1
+    GX = 2
+    GO = 3
+
+class ModelGrayFamily(IBooleanCircuitModel):
+    def name(self) -> str:
+        return "Model-2: Gray family"
+
+    def forward(self, raw: bytes, param_code: int) -> bytes:
+        variant = param_code & 0x03
+        n = len(raw)
+        if n == 0:
+            return b""
+        out = bytearray(n)
+        out[0] = raw[0]
+        if n == 1:
+            return bytes(out)
+        out[1] = gate_xor(raw[1], raw[0], 8)
+        for i in range(2, n):
+            p1, p2 = raw[i - 1], raw[i - 2]
+            if variant == GrayVariant.G1:
+                predictor = gray_code(p1, 8)
+            elif variant == GrayVariant.G2:
+                predictor = gray_code(p2, 8)
+            elif variant == GrayVariant.GX:
+                predictor = gray_code(gate_xor(p1, p2, 8), 8)
+            elif variant == GrayVariant.GO:
+                predictor = gray_code(gate_or(p1, p2), 8)
+            else:
+                predictor = 0
+            out[i] = gate_xor(raw[i], predictor, 8)
+        return bytes(out)
+
+    def backward(self, residual: bytes, param_code: int) -> bytes:
+        variant = param_code & 0x03
+        n = len(residual)
+        if n == 0:
+            return b""
+        raw = bytearray(n)
+        raw[0] = residual[0]
+        if n == 1:
+            return bytes(raw)
+        raw[1] = gate_xor(residual[1], raw[0], 8)
+        for i in range(2, n):
+            p1, p2 = raw[i - 1], raw[i - 2]
+            if variant == GrayVariant.G1:
+                predictor = gray_code(p1, 8)
+            elif variant == GrayVariant.G2:
+                predictor = gray_code(p2, 8)
+            elif variant == GrayVariant.GX:
+                predictor = gray_code(gate_xor(p1, p2, 8), 8)
+            elif variant == GrayVariant.GO:
+                predictor = gray_code(gate_or(p1, p2), 8)
+            else:
+                predictor = 0
+            raw[i] = gate_xor(residual[i], predictor, 8)
+        return bytes(raw)
+
+# ---- Model 3: Nibble-MUX Interleave (parameterless) ----
+
+def _nibble_equal_high_mask(a: int, b: int) -> int:
+    # XOR then isolate high nibble and downshift to a 4-bit lane
+    xor_result = gate_xor(a, b, 8)
+    xor_result = (xor_result & 0xF0) >> 4
+    # OR-reduce to 1 bit (LSB)
+    r = xor_result
+    r |= (r >> 2)
+    r |= (r >> 1)
+    any_bit1 = r & 1
+    equal_bit1 = gate_not(any_bit1, 1)  # 1 if equal
+    mask = equal_bit1 | (equal_bit1 << 1)
+    mask |= (mask << 2)
+    mask <<= 4
+    return _b(mask)
+
+def _nibble_equal_low_mask(a: int, b: int) -> int:
+    xor_result = gate_xor(a, b, 8) & 0x0F
+    r = xor_result
+    r |= (r >> 2)
+    r |= (r >> 1)
+    any_bit1 = r & 1
+    equal_bit1 = gate_not(any_bit1, 1)
+    mask = equal_bit1 | (equal_bit1 << 1)
+    mask |= (mask << 2)
+    return _b(mask)
+
+class ModelInterleave(IBooleanCircuitModel):
+    def name(self) -> str:
+        return "Model-3: Nibble-MUX Interleave"
+
+    def forward(self, raw: bytes, param_code: int) -> bytes:
+        n = len(raw)
+        if n == 0:
+            return b""
+        out = bytearray(n)
+        out[0] = raw[0]
+        if n == 1:
+            return bytes(out)
+        out[1] = gate_xor(raw[1], raw[0], 8)
+        for i in range(2, n):
+            a = raw[i - 1]
+            b = raw[i - 2]
+            p_cross = _b((a & 0xF0) | (b & 0x0F))
+            p_run   = a
+            high_equal = _nibble_equal_high_mask(a, b)
+            low_equal  = _nibble_equal_low_mask(a, b)
+            select_mask = _b(gate_not(high_equal, 8) & 0xF0 | gate_not(low_equal, 8) & 0x0F)
+            predictor = mux_mask(select_mask, p_cross, p_run)
+            out[i] = gate_xor(raw[i], predictor, 8)
+        return bytes(out)
+
+    def backward(self, residual: bytes, param_code: int) -> bytes:
+        n = len(residual)
+        if n == 0:
+            return b""
+        raw = bytearray(n)
+        raw[0] = residual[0]
+        if n == 1:
+            return bytes(raw)
+        raw[1] = gate_xor(residual[1], raw[0], 8)
+        for i in range(2, n):
+            a = raw[i - 1]
+            b = raw[i - 2]
+            p_cross = _b((a & 0xF0) | (b & 0x0F))
+            p_run   = a
+            high_equal = _nibble_equal_high_mask(a, b)
+            low_equal  = _nibble_equal_low_mask(a, b)
+            select_mask = _b(gate_not(high_equal, 8) & 0xF0 | gate_not(low_equal, 8) & 0x0F)
+            predictor = mux_mask(select_mask, p_cross, p_run)
+            raw[i] = gate_xor(residual[i], predictor, 8)
+        return bytes(raw)
+
+# ---- Model 4: Majority-of-3 (BM3) ----
+
+class ModelBM3(IBooleanCircuitModel):
+    def name(self) -> str:
+        return "Model-4: Majority-of-3"
+
+    def forward(self, raw: bytes, param_code: int) -> bytes:
+        n = len(raw)
+        if n == 0:
+            return b""
+        out = bytearray(n)
+        out[0] = raw[0]
+        if n == 1:
+            return bytes(out)
+        out[1] = gate_xor(raw[1], raw[0], 8)
+        if n == 2:
+            return bytes(out)
+        out[2] = gate_xor(raw[2], raw[1], 8)
+        for i in range(3, n):
+            predictor = gate_majority_3(raw[i - 1], raw[i - 2], raw[i - 3])
+            out[i] = gate_xor(raw[i], predictor, 8)
+        return bytes(out)
+
+    def backward(self, residual: bytes, param_code: int) -> bytes:
+        n = len(residual)
+        if n == 0:
+            return b""
+        raw = bytearray(n)
+        raw[0] = residual[0]
+        if n == 1:
+            return bytes(raw)
+        raw[1] = gate_xor(residual[1], raw[0], 8)
+        if n == 2:
+            return bytes(raw)
+        raw[2] = gate_xor(residual[2], raw[1], 8)
+        for i in range(3, n):
+            predictor = gate_majority_3(raw[i - 1], raw[i - 2], raw[i - 3])
+            raw[i] = gate_xor(residual[i], predictor, 8)
+        return bytes(raw)
+
+# ---- Model 5: Morpho-Predict ----
+
+class ModelMorpho(IBooleanCircuitModel):
+    def name(self) -> str:
+        return "Model-5: Morpho-Predict"
+
+    def forward(self, raw: bytes, param_code: int) -> bytes:
+        use_close = (param_code & 0x1) == 0
+        n = len(raw)
+        if n == 0:
+            return b""
+        out = bytearray(n)
+        out[0] = raw[0]
+        for i in range(1, n):
+            data = raw[i - 1]
+            edge_data = edge1(data)
+            morpho = close1(data) if use_close else open1(data)
+            predictor = mux_mask(edge_data, morpho, data)
+            out[i] = gate_xor(raw[i], predictor, 8)
+        return bytes(out)
+
+    def backward(self, residual: bytes, param_code: int) -> bytes:
+        use_close = (param_code & 0x1) == 0
+        n = len(residual)
+        if n == 0:
+            return b""
+        raw = bytearray(n)
+        raw[0] = residual[0]
+        for i in range(1, n):
+            data = raw[i - 1]
+            edge_data = edge1(data)
+            morpho = close1(data) if use_close else open1(data)
+            predictor = mux_mask(edge_data, morpho, data)
+            raw[i] = gate_xor(residual[i], predictor, 8)
+        return bytes(raw)
+
+# =========================================
+# Evaluators, scoring and selector
+# =========================================
+
+def _make_choice(code: int, param: int, name: str, bytes_out: bytes) -> TransformChoice:
+    return TransformChoice(bytes_out, zero_order_entropy_bits_per_byte(bytes_out), code, param, name)
+
+# M1: Delta-k (k=1..4)
+def _eval_m1_k(blk: bytes, m: ModelDeltaK, k: int) -> TransformChoice:
+    y = m.forward(blk, k)
+    return _make_choice(1, k, f"{m.name()}[k={k}]", y)
+
+# M2: Gray (4 variants)
+def _eval_m2_v(blk: bytes, m: ModelGrayFamily, v: int, tag: str) -> TransformChoice:
+    y = m.forward(blk, v)
+    return _make_choice(2, v, f"{m.name()}[{tag}]", y)
+
+# M3: Interleave (single)
+def _eval_m3(blk: bytes, m: ModelInterleave) -> TransformChoice:
+    y = m.forward(blk, 0)
+    return _make_choice(3, 0, m.name(), y)
+
+# M4: BM3
+def _eval_m4(blk: bytes, m: ModelBM3) -> TransformChoice:
+    y = m.forward(blk, 0)
+    return _make_choice(4, 0, m.name(), y)
+
+# M5: Morpho (close/open)
+def _eval_m5(blk: bytes, m: ModelMorpho, use_close: bool) -> TransformChoice:
+    p = 0 if use_close else 1
+    y = m.forward(blk, p)
+    tag = "close1" if use_close else "open1"
+    return _make_choice(5, p, f"{m.name()}[{tag}]", y)
+
+def _pick_better(a: TransformChoice, b: TransformChoice) -> TransformChoice:
+    # 1) minimize H0
+    if b.H0_bits_per_byte < a.H0_bits_per_byte - 1e-12:
+        return b
+    if abs(b.H0_bits_per_byte - a.H0_bits_per_byte) <= 1e-12:
+        # tie-break: smaller model_code, then smaller param_code
+        if b.model_code < a.model_code:
+            return b
+        if b.model_code == a.model_code and b.param_code < a.param_code:
+            return b
+    return a
+
+# =========================================
+# Public entrypoints used by V2 pipeline
+# =========================================
+
+def _eval_candidate(kind: str, raw: bytes, param: int = 0) -> TransformChoice:
     """
-    lane_mask = (1 << width) - 1
-    return (~a) & lane_mask
-
-
-def gate_xor(a: int, b: int, width: int = 8) -> int:
-    """Bitwise XOR expressed with gates only: `(a OR b) AND NOT(a AND b)`.
-
-    Notes
-    -----
-    Using `NOT` with width-masking preserves the fixed-lane model.
+    kind ∈ {
+      'id',
+      'm1_k1','m1_k2','m1_k3','m1_k4',
+      'm2_g1','m2_g2','m2_gx','m2_go',
+      'm3',
+      'm4',
+      'm5_close','m5_open'
+    }
     """
-    return (a | b) & gate_not((a & b), width)
+    if kind == 'id':
+        return TransformChoice(raw, zero_order_entropy_bits_per_byte(raw), 0, 0, "Identity")
+
+    if kind.startswith('m1_'):
+        k = { 'm1_k1':1, 'm1_k2':2, 'm1_k3':3, 'm1_k4':4 }[kind]
+        m = ModelDeltaK()
+        y = m.forward(raw, k)
+        return _make_choice(1, k, f"{m.name()}[k={k}]", y)
+
+    if kind.startswith('m2_'):
+        v   = { 'm2_g1':GrayVariant.G1, 'm2_g2':GrayVariant.G2,
+                'm2_gx':GrayVariant.GX, 'm2_go':GrayVariant.GO }[kind]
+        tag = { GrayVariant.G1:'G1', GrayVariant.G2:'G2',
+                GrayVariant.GX:'GX', GrayVariant.GO:'GO' }[v]
+        m = ModelGrayFamily()
+        y = m.forward(raw, v)
+        return _make_choice(2, v, f"{m.name()}[{tag}]", y)
+
+    if kind == 'm3':
+        m = ModelInterleave()
+        y = m.forward(raw, 0)
+        return _make_choice(3, 0, m.name(), y)
+
+    if kind == 'm4':
+        m = ModelBM3()
+        y = m.forward(raw, 0)
+        return _make_choice(4, 0, m.name(), y)
+
+    if kind == 'm5_close':
+        m = ModelMorpho()
+        y = m.forward(raw, 0)
+        return _make_choice(5, 0, f"{m.name()}[close1]", y)
+
+    if kind == 'm5_open':
+        m = ModelMorpho()
+        y = m.forward(raw, 1)
+        return _make_choice(5, 1, f"{m.name()}[open1]", y)
+
+    # Fallback
+    return TransformChoice(raw, zero_order_entropy_bits_per_byte(raw), 0, 0, "Identity")
 
 
-def prefix_or_word(x: int, width: int) -> int:
-    """Intra-word prefix-OR (`scan OR`) using only shifts and ORs.
+def _best_choice(choices: Iterable[TransformChoice]) -> TransformChoice:
+    it = iter(choices)
+    best = next(it)
+    for c in it:
+        best = _pick_better(best, c)
+    return best
 
-    For each bit position *i* (0-indexed, LSB), the result bit is `1` iff any
-    of the lower-or-equal bits of `x` up to *i* is `1`. Implements a standard
-    log-doubling parallel scan (d ∈ {1,2,4,8,...}).
 
-    Parameters
-    ----------
-    x : int
-        Input word.
-    width : int
-        Active bit-lane width.
+def circuit_map_automaton_forward(
+    raw_block: bytes,
+    parallel: bool = True,
+    executor: str = 'process',   # 'process' for CPU-bound; 'thread' if you insist threads
+    max_workers: int | None = None
+) -> tuple[bytes, dict]:
     """
-    distance: int = 1
-    result: int = x & ((1 << width) - 1)
-    lane_mask: int = (1 << width) - 1
-    while distance < width:
-        result = gate_or(result, (result << distance) & lane_mask)
-        distance <<= 1
-    return result
-
-
-def left_band(beta: int, L: int, width: int) -> int:
-    """`band(beta, L) = prefix_or(beta) & ~prefix_or(beta << L)`.
-
-    Intuition: selects a *left-closed, right-open* band of ones whose length is
-    controlled by `L`, built purely from prefix-ORs and masking.
+    Parallel evaluation of Identity + 5 model families; pick best by H0 (tie: model_code, param_code).
+    Returns (mapped, theta) where theta carries {"mode","param"/"mode_param","name","H0"}.
     """
-    lane_mask = (1 << width) - 1
-    pref = prefix_or_word(beta & lane_mask, width)
-    cut = prefix_or_word((beta << L) & lane_mask, width)
-    return gate_and(pref, gate_not(cut, width))
-
-
-def byte_eq(a: int, b: int) -> int:
-    """
-    Branch-free, gate-only byte equality that returns a canonical mask.
-
-    Returns
-    -------
-    int
-        0xFF if a == b, else 0x00. The result is constructed purely with
-        Boolean gates (AND/OR/NOT/XOR) and shifts — no arithmetic on values
-        and no data-dependent branches.
-
-    Binary model
-    ------------
-    - 8-bit lane; inputs are masked to the lane (two's-complement NOT with width).
-    - Predicates are expressed as all-ones / all-zeros masks (mask-as-Boolean).
-
-    Implementation (all gates, no branches)
-    ---------------------------------------
-    1) x := a XOR b  (within the 8-bit lane). If a == b then x == 0.
-    2) Reduce to a 1-bit “any_one” flag by OR-folding:
-         x1 = x | (x >> 4); x1 = x1 | (x1 >> 2); x1 = x1 | (x1 >> 1)
-       Now any_one = x1 & 1  (1 iff any bit of x was 1).
-    3) eq_bit := NOT(any_one) in a 1-bit lane → eq_bit ∈ {0,1}.
-    4) Replicate eq_bit across the 8-bit lane by OR-ing shifted copies:
-         mask = (eq_bit<<0) | (eq_bit<<1) | ... | (eq_bit<<7)
-       This yields 0xFF when eq_bit==1, else 0x00.
-
-    Correctness sketch
-    ------------------
-    - If a == b ⇒ x == 0 ⇒ any_one == 0 ⇒ eq_bit == 1 ⇒ mask == 0xFF.
-    - If a != b ⇒ x != 0 ⇒ any_one == 1 ⇒ eq_bit == 0 ⇒ mask == 0x00.
-
-    Complexity
-    ----------
-    O(1) bit-operations on fixed-width bytes; no data-dependent control flow.
-    """
-    width = 8
-    lane_mask = (1 << width) - 1
-
-    # 1) XOR in-lane
-    x = gate_xor(a & lane_mask, b & lane_mask, width)
-
-    # 2) OR-fold to “any bit set”
-    x1 = gate_or(x, (x >> 4) & 0x0F)
-    x1 = gate_or(x1, (x1 >> 2) & 0x3F)
-    x1 = gate_or(x1, (x1 >> 1) & 0x7F)
-    any_one = x1 & 1  # 1 if any bit in x was 1
-
-    # 3) 1-bit NOT to get equality bit
-    eq_bit = gate_not(any_one, 1) & 1  # ensure ∈ {0,1}
-
-    # 4) Replicate eq_bit to full 8-bit mask by ORing shifted copies
-    mask  = 0
-    mask  = (eq_bit << 0) & 0xFF
-    mask |= (eq_bit << 1) & 0xFF
-    mask |= (eq_bit << 2) & 0xFF
-    mask |= (eq_bit << 3) & 0xFF
-    mask |= (eq_bit << 4) & 0xFF
-    mask |= (eq_bit << 5) & 0xFF
-    mask |= (eq_bit << 6) & 0xFF
-    mask |= (eq_bit << 7) & 0xFF
-
-    return mask
-
-
-def mux_byte(m: int, a: int, b: int, width: int = 8) -> int:
-    """2:1 multiplexer on a byte lane: `m=0xFF` selects `a`; `m=0x00` selects `b`.
-
-    Implemented as `(m & a) | (~m & b)` with width-masked NOT. Non-canonical
-    masks (other values) will behave bitwise and may mix bits; callers should
-    pass canonical masks (all-ones or all-zeros) for selection semantics.
-    """
-    return gate_or(gate_and(m, a), gate_and(gate_not(m, width), b))
-
-
-def _gray_pred(v: int) -> int:
-    """Gray-code predictor: `g = v XOR (v >> 1)` built from gates.
-
-    Used as an alternative local predictor in the automata below.
-    """
-    return gate_xor(v, (v >> 1), 8)
-
-
-###############################################################################
-# Four automaton modes (all reversible; pure gates in the critical path),
-# plus the run-segment selection Mode 4.
-###############################################################################
-
-
-def _mode1_forward(block: bytes) -> bytes:
-    """Mode 1 (order-1 residual): `y[i] = x[i] XOR x[i-1]`.
-
-    The first byte is copied through to seed the recursion.
-    """
-    if not block:
-        return b""
-    length = len(block)
-    output_bytes = bytearray(length)
-    output_bytes[0] = block[0]
-    for index in range(1, length):
-        output_bytes[index] = gate_xor(block[index], block[index - 1], 8)
-    return bytes(output_bytes)
-
-
-def _mode1_inverse(residual: bytes) -> bytes:
-    """Inverse of Mode 1: reconstructs `x[i]` from residuals and history."""
-    if not residual:
-        return b""
-    length = len(residual)
-    output_bytes = bytearray(length)
-    output_bytes[0] = residual[0]
-    for index in range(1, length):
-        output_bytes[index] = gate_xor(residual[index], output_bytes[index - 1], 8)
-    return bytes(output_bytes)
-
-
-def _mode2_forward(block: bytes) -> bytes:
-    """Mode 2 (Gray predictor): `y[i] = x[i] XOR Gray(x[i-1])`."""
-    if not block:
-        return b""
-    length = len(block)
-    output_bytes = bytearray(length)
-    output_bytes[0] = block[0]
-    for index in range(1, length):
-        predictor = _gray_pred(block[index - 1])
-        output_bytes[index] = gate_xor(block[index], predictor, 8)
-    return bytes(output_bytes)
-
-
-def _mode2_inverse(residual: bytes) -> bytes:
-    """Inverse of Mode 2 using the same Gray predictor derived from decoded history."""
-    if not residual:
-        return b""
-    length = len(residual)
-    output_bytes = bytearray(length)
-    output_bytes[0] = residual[0]
-    for index in range(1, length):
-        predictor = _gray_pred(output_bytes[index - 1])
-        output_bytes[index] = gate_xor(residual[index], predictor, 8)
-    return bytes(output_bytes)
-
-
-def _mode3_forward(block: bytes) -> bytes:
-    """Mode 3 (order-2 residual):
-    `y[1] = x[1] XOR x[0]`; for `i >= 2`, `y[i] = x[i] XOR x[i-2]`.
-    """
-    length = len(block)
-    if length == 0:
-        return b""
-    if length == 1:
-        return bytes([block[0]])
-    output_bytes = bytearray(length)
-    output_bytes[0] = block[0]
-    output_bytes[1] = gate_xor(block[1], block[0], 8)
-    for index in range(2, length):
-        output_bytes[index] = gate_xor(block[index], block[index - 2], 8)
-    return bytes(output_bytes)
-
-
-def _mode3_inverse(residual: bytes) -> bytes:
-    """Inverse of Mode 3 (order-2 residual)."""
-    length = len(residual)
-    if length == 0:
-        return b""
-    if length == 1:
-        return bytes([residual[0]])
-    output_bytes = bytearray(length)
-    output_bytes[0] = residual[0]
-    output_bytes[1] = gate_xor(residual[1], output_bytes[0], 8)
-    for index in range(2, length):
-        output_bytes[index] = gate_xor(residual[index], output_bytes[index - 2], 8)
-    return bytes(output_bytes)
-
-
-def _mode4_forward(block: bytes) -> bytes:
-    """Mode 4 (run-segment selector, reversible, gates + MUX only).
-
-    For `i >= 2`, choose between two predictors based on *local equality* of the
-    last two decoded bytes, expressed as a canonical mask via `byte_eq`:
-
-    - `pred_run = x[i-1]` when a run continues (`x[i-1] == x[i-2]`).
-    - `pred_alt = Gray(x[i-1])` otherwise, to avoid overfitting to runs.
-
-    The selector is realized as `pred = mux_byte(m, pred_run, pred_alt)` with
-    `m ∈ {0xFF, 0x00}`. Residuals are formed by XORing the current byte with the
-    predictor.
-    """
-    length = len(block)
-    if length == 0:
-        return b""
-    if length == 1:
-        return bytes([block[0]])
-    output_bytes = bytearray(length)
-    output_bytes[0] = block[0]
-    output_bytes[1] = gate_xor(block[1], block[0], 8)
-    for index in range(2, length):
-        selector_mask = byte_eq(block[index - 1], block[index - 2])  # 0xFF or 0x00
-        pred_run = block[index - 1] & 0xFF
-        pred_alt = _gray_pred(block[index - 1])
-        predictor = mux_byte(selector_mask, pred_run, pred_alt)
-        output_bytes[index] = gate_xor(block[index], predictor, 8)
-    return bytes(output_bytes)
-
-
-def _mode4_inverse(residual: bytes) -> bytes:
-    """Inverse of Mode 4 using the same run/alt selection recomputed from history."""
-    length = len(residual)
-    if length == 0:
-        return b""
-    if length == 1:
-        return bytes([residual[0]])
-    output_bytes = bytearray(length)
-    output_bytes[0] = residual[0]
-    output_bytes[1] = gate_xor(residual[1], output_bytes[0], 8)
-    for index in range(2, length):
-        selector_mask = byte_eq(output_bytes[index - 1], output_bytes[index - 2])
-        pred_run = output_bytes[index - 1] & 0xFF
-        pred_alt = _gray_pred(output_bytes[index - 1])
-        predictor = mux_byte(selector_mask, pred_run, pred_alt)
-        output_bytes[index] = gate_xor(residual[index], predictor, 8)
-    return bytes(output_bytes)
-
-
-###############################################################################
-# External wrapper (mode selection + reversibility). Mode 4 is included.
-###############################################################################
-
-def circuit_map_automaton_forward(block: bytes) -> Tuple[bytes, Dict]:
-    """Select the best reversible mapping by minimum 0th-order entropy.
-
-    Returns
-    -------
-    (mapped_bytes, {"mode": m}) with `m ∈ {0,1,2,3,4}`.
-
-    Notes
-    -----
-    Mode 0 is the identity (no transform). Ties on entropy break toward the
-    smaller mode number to ensure deterministic selection.
-    """
-    from collections import Counter
-    import math
-
-    def H0(data: bytes) -> float:
-        if not data:
-            return 0.0
-        length_local = len(data)
-        counts = Counter(data)
-        h = 0.0
-        for v in counts.values():
-            p = v / length_local
-            h -= p * math.log2(p)
-        return h
-
-    candidates = [
-        (0, block),
-        (1, _mode1_forward(block)),
-        (2, _mode2_forward(block)),
-        (3, _mode3_forward(block)),
-        (4, _mode4_forward(block)),  # run-segment selection automaton
+    # identity is also evaluated as a "candidate" for consistent tie-breaking
+    kinds = [
+        'id',
+        'm1_k1','m1_k2','m1_k3','m1_k4',
+        'm2_g1','m2_g2','m2_gx','m2_go',
+        'm3',
+        'm4',
+        'm5_close','m5_open'
     ]
 
-    best_mode = 0
-    best_bytes = block
-    best_entropy = H0(block)
+    if not parallel:
+        # deterministic, single-threaded (useful for debugging)
+        results = [_eval_candidate(k, raw_block) for k in kinds]
+    else:
+        max_workers = max_workers or os.cpu_count() or 4
+        pool_cls = ThreadPoolExecutor if executor == 'thread' else ProcessPoolExecutor
+        results = []
+        with pool_cls(max_workers=max_workers) as pool:
+            futs = { pool.submit(_eval_candidate, k, raw_block): k for k in kinds }
+            for fut in as_completed(futs):
+                results.append(fut.result())
 
-    # Prefer lower mode index on exact entropy ties
-    for mode_id, mapped in candidates[1:]:
-        ent = H0(mapped)
-        if ent < best_entropy - 1e-9 or (abs(ent - best_entropy) <= 1e-9 and mode_id < best_mode):
-            best_mode, best_bytes, best_entropy = mode_id, mapped, ent
+    best = _best_choice(results)
 
-    return best_bytes, {"mode": best_mode}
+    theta = {
+        "mode": best.model_code,
+        "param": best.param_code,
+        "mode_param": best.param_code,  # alias
+        "name": best.model_name,
+        "H0": best.H0_bits_per_byte,
+    }
+    return best.transform_bytes, theta
 
-
-def circuit_map_automaton_inverse(mapped: bytes, theta: Dict) -> bytes:
-    """Inverse of the selected mapping.
-
-    Parameters
-    ----------
-    mapped : bytes
-        The transformed bytes.
-    theta : Dict
-        Must contain key `"mode"` with the integer mode id.
+def circuit_map_automaton_inverse(mapped: bytes,
+                                  mode_or_theta: Union[int, Dict[str, Any]],
+                                  param: Optional[int] = None) -> bytes:
     """
-    mode_id = int(theta.get("mode", 0)) & 0xFF
-    if mode_id == 0:
+    Inverse mapping.
+    Accepts either:
+      - (mapped, {"mode": m, "param": p})  OR  (mapped, {"mode": m, "mode_param": p})
+      - (mapped, m, p)
+    """
+    # Unpack mode/param from either calling style
+    if isinstance(mode_or_theta, dict):
+        mode = int(mode_or_theta.get("mode", 0))
+        p = int(mode_or_theta.get("param", mode_or_theta.get("mode_param", 0)))
+    else:
+        mode = int(mode_or_theta)
+        p = int(param or 0)
+
+    M1 = ModelDeltaK()
+    M2 = ModelGrayFamily()
+    M3 = ModelInterleave()
+    M4 = ModelBM3()
+    M5 = ModelMorpho()
+
+    if mode == 0:
+        return mapped  # Identity
+    elif mode == 1:
+        return M1.backward(mapped, p)
+    elif mode == 2:
+        return M2.backward(mapped, p)
+    elif mode == 3:
+        return M3.backward(mapped, p)
+    elif mode == 4:
+        return M4.backward(mapped, p)
+    elif mode == 5:
+        return M5.backward(mapped, p)
+    else:
         return mapped
-    if mode_id == 1:
-        return _mode1_inverse(mapped)
-    if mode_id == 2:
-        return _mode2_inverse(mapped)
-    if mode_id == 3:
-        return _mode3_inverse(mapped)
-    if mode_id == 4:
-        return _mode4_inverse(mapped)
-    # Unknown mode → conservative: identity (keeps reversibility of known modes)
-    return mapped
 
-def _first_order_bit_entropy(block: bytes) -> float:
-    """Approximate first‑order (Markov) bit entropy of a byte block.
-
-    We treat the block as a sequence of bits and estimate the conditional
-    entropy H(bit_t | bit_{t-1}).  Transitions between adjacent bits are
-    counted to obtain joint and marginal distributions.  If the block
-    is too short, a default entropy of 1.0 is returned (maximally
-    random)."""
-    nbits = len(block) * 8
-    if nbits < 2:
-        return 1.0
-    # counts[x][y] counts transitions from bit x to bit y
-    counts = [[0, 0], [0, 0]]
-    # count transitions
-    prev = (block[0] >> 7) & 1
-    bit_idx = 1
-    for b in block:
-        for k in range(8):
-            if b == block[0] and k == 0:
-                # skip first bit (already prev)
-                continue
-            bit = (b >> (7 - k)) & 1
-            counts[prev][bit] += 1
-            prev = bit
-            bit_idx += 1
-    # compute probabilities
-    total_trans = float(nbits - 1)
-    H = 0.0
-    # compute marginal P(x) (sum counts[x][0]+counts[x][1])
-    for x in [0, 1]:
-        px = counts[x][0] + counts[x][1]
-        if px == 0:
-            continue
-        for y in [0, 1]:
-            pxy = counts[x][y]
-            if pxy == 0:
-                continue
-            p_y_given_x = pxy / px
-            H -= (pxy / total_trans) * math.log2(p_y_given_x)
-    return H
+# ----------------------------- Boolean circuit gates ends here -------------------------------
 
 ###############################################################################
 # Bitwise reversible circuit modules
@@ -949,20 +1173,6 @@ def bitplanes_to_bytes(planes: List[List[int]]) -> bytes:
               ((planes[6][t] & 1) << 1) | ((planes[7][t] & 1) << 0)
         out[t] = val
     return bytes(out)
-    
-def avg_run_bits(bits: list[int]) -> float:
-    if not bits: return 0.0
-    runs, prev = 1, bits[0]
-    for b in bits[1:]:
-        if b != prev:
-            runs += 1; prev = b
-    return len(bits)/runs
-def H0_bits(bits: list[int]) -> float:
-    if not bits: return 0.0
-    n = len(bits); c1 = sum(bits)
-    import math
-    p = c1/n
-    return 0.0 if p==0.0 or p==1.0 else -p*math.log2(p) - (1-p)*math.log2(1-p)
     
 def rle_binary(bits: list[int]) -> tuple[int, list[int]]:
     if not bits: return (0, [])
@@ -1285,133 +1495,133 @@ def _choose_best_rice(runs: list[int]) -> tuple[int, bytes]:
             best_k, best_bytes = k, buf
     return best_k, best_bytes
 
-def encode_new_pipeline(block: bytes) -> Tuple[bytes, Dict[str, Any]]:
+def encode_new_pipeline(block: bytes) -> bytes:
     """
-    V2 pipeline (slim header, NOT backward compatible):
+    V2 pipeline (slim header; self-describing; no external meta).
 
-      bytes --circuit_map_automaton--> mapped
+      bytes --circuit_map_automaton--> mapped (mode, mode_param)
       mapped --split--> 8 bit-planes (MSB-first)
-      per plane: compare RAW vs (BBWT -> RLE -> Rice with optimal k), pick smaller
-      header = [hdr0 | raw_mask | b1_mask | k_list_for_encoded_planes]
-      payload = concat_j RAW_bytes or Rice_bitstream (each plane byte-aligned)
-
-    Notes
-    -----
-    - No internal flag/L/run_count/paylen. Decoder uses container's `orig_len` as L.
-    - After each encoded plane's Rice stream, we pad to the next byte boundary.
+      per plane: RAW vs (BBWT -> RLE -> Rice best k), choose smaller
+      header = header0 | param(LE,param_len) | raw_mask | b1_mask | k_list(for encoded planes)
+      payload = concat of per-plane bytes (each plane byte-aligned)
     """
     if not block:
-        return b"", {}
+        return b""
 
-    # 1) reversible byte-wise circuit (mode autodetected by H0)
+    # 1) reversible automaton: expect {"mode": m, possibly "param"/"mode_param"/"param_code"}
     mapped, theta = circuit_map_automaton_forward(block)
-    mode = int(theta.get("mode", 0)) & 7  # 3 bits are enough
+    mode = int(theta.get("mode", 0)) & 0x7
+    mode_param = int(
+        theta.get("param",
+                  theta.get("mode_param",
+                            theta.get("param_code", 0)))
+    ) & 0xFFFFFFFF
+
+    def _param_len_of(p: int) -> int:
+        if p == 0:            return 0
+        if p <= 0xFF:         return 1
+        if p <= 0xFFFF:       return 2
+        if p <= 0xFFFFFF:     return 3
+        return 4
 
     # 2) split to bit-planes
     planes, L = bytes_to_bitplanes(mapped)
-    nbytes_plane = (L + 7) // 8
 
     raw_mask = 0
     b1_mask  = 0
-    k_bytes: list[int] = []
-    payload_chunks: list[bytes] = []
+    k_list: list[int] = []
+    chunks: list[bytes] = []
 
     for j in range(8):
         Uj = planes[j]
-        # Build both candidates then pick smaller:
-        # RAW candidate
         raw_bytes = pack_bits_to_bytes(Uj)
 
-        # ENCODED candidate: BBWT -> RLE -> Rice (best k)
-        Lj = bbwt_forward(bytes(Uj))
-        Lj_bits = list(Lj)
+        Lj = bbwt_forward(bytes(Uj))          # over alphabet {0,1}
+        Lj_bits = list(Lj)                    # still 0/1
         b1, runs = rle_binary(Lj_bits)
         if not runs:
-            # Degenerate: treat as RAW
             raw_mask |= (1 << j)
-            payload_chunks.append(raw_bytes)
+            chunks.append(raw_bytes)
             continue
         k_opt, rice_bytes = _choose_best_rice(runs)
 
-        # Compare sizes (count 1 extra byte for k if encoded)
+        # pay +1B in header for k if ENCODED
         if len(raw_bytes) <= len(rice_bytes) + 1:
-            # Choose RAW
             raw_mask |= (1 << j)
-            payload_chunks.append(raw_bytes)
+            chunks.append(raw_bytes)
         else:
-            # Choose ENCODED
-            # record b1 and k
             if b1 & 1:
                 b1_mask |= (1 << j)
-            k_bytes.append(k_opt & 0xFF)
-            payload_chunks.append(rice_bytes)
+            k_list.append(k_opt & 0xFF)
+            chunks.append(rice_bytes)
 
-    # 3) header assembly
-    hdr0 = (mode & 0x07) << 5
-    header = bytearray([hdr0, raw_mask & 0xFF, b1_mask & 0xFF])
-    # append k_list in j order for encoded planes
-    enc_iter = iter(k_bytes)
-    # 保证顺序一致：按 j=0..7 只对 encoded 平面写 k
-    #（这里其实不需要回写，因为 k_bytes 已经按生成顺序了；此步仅作自检）
-    # 若更稳妥，可改成：逐平面扫描 raw_mask==0 时从 enc_iter 取一个 k 写入。
+    # 3) header
+    param_len = _param_len_of(mode_param)
+    header0 = ((mode & 0x07) << 5) | (param_len & 0x07)
+    header = bytearray()
+    header.append(header0)
+    for i in range(param_len):
+        header.append((mode_param >> (8 * i)) & 0xFF)
+    header.append(raw_mask & 0xFF)
+    header.append(b1_mask & 0xFF)
+    # k_list for ENCODED planes only, in j order
+    k_it = iter(k_list)
     for j in range(8):
         if ((raw_mask >> j) & 1) == 0:
-            header.append(next(enc_iter))
+            header.append(next(k_it))
 
-    # 4) payload assembly（编码平面已按字节对齐；我们不再跨平面共享比特位）
-    payload = b"".join(payload_chunks)
+    # 4) payload = concat per-plane chunks (already byte-aligned)
+    payload = b"".join(chunks)
 
-    return bytes(header) + payload, {}  # meta 无需额外信息
+    return bytes(header) + payload
 
-
-# ------------------- REPLACE: decode_new_pipeline (slim header; uses orig_len) -------------------
-
-def decode_new_pipeline(payload: bytes, orig_len: int, meta: Dict[str, Any]) -> bytes:
+def decode_new_pipeline(payload: bytes, orig_len: int) -> bytes:
     """
-    Inverse of slim-header V2 pipeline.
+    Inverse of V2 slim header:
 
-    Header layout:
-      hdr0(1B):  mode in top 3 bits (mode = hdr0 >> 5)
-      raw_mask:  1B
-      b1_mask:   1B
-      k_list:    1B per encoded plane (in j order, j=0..7)
-
-    Payload layout:
-      For j=0..7:
-        if RAW:     ceil(L/8) bytes of packed bits
-        if ENCODED: Rice bitstream (byte-aligned after finishing this plane)
+      header0: 1B  (mode in bits[7:5], param_len in bits[2:0])
+      param  : param_len bytes (LE32 fragment of mode_param)
+      raw_ms : 1B  raw_mask
+      b1_ms  : 1B  b1_mask
+      k_list : 1B per ENCODED plane (in j order)
+      data   : plane payloads (each plane byte-aligned)
     """
     L = int(orig_len)
     if L == 0:
         return b""
-
     if len(payload) < 3:
         raise ValueError("V2 slim header truncated")
 
     pos = 0
-    hdr0 = payload[pos]; pos += 1
+    header0 = payload[pos]; pos += 1
+    mode     = (header0 >> 5) & 0x07
+    param_len = header0 & 0x07
+    if param_len > 4:
+        raise ValueError("V2 slim header invalid param_len (>4)")
+
+    # param (exactly param_len bytes, LE)
+    if len(payload) < 1 + param_len + 2:
+        raise ValueError("V2 slim header truncated (param/raw/b1)")
+    mode_param = 0
+    for i in range(param_len):
+        mode_param |= payload[pos] << (8 * i); pos += 1
+
     raw_mask = payload[pos]; pos += 1
     b1_mask  = payload[pos]; pos += 1
-    mode = (hdr0 >> 5) & 0x07
 
-    # Read k_list (encoded planes only, in j order)
-    k_list: list[int] = []
+    # k_list for ENCODED planes
     enc_count = 8 - bin(raw_mask).count("1")
     if pos + enc_count > len(payload):
         raise ValueError("V2 slim header k_list truncated")
-    for _ in range(enc_count):
-        k_list.append(payload[pos]); pos += 1
+    k_list = list(payload[pos:pos + enc_count]); pos += enc_count
 
-    # Prepare to read payload at byte boundary
     data = payload[pos:]
-    data_pos = 0  # byte index into 'data'
-
+    data_pos = 0
     planes: list[list[int]] = []
-    k_iter = iter(k_list)
+    k_it = iter(k_list)
 
     for j in range(8):
         if ((raw_mask >> j) & 1) == 1:
-            # RAW plane
             need = (L + 7) // 8
             if data_pos + need > len(data):
                 raise ValueError("V2 payload truncated in RAW plane")
@@ -1419,26 +1629,23 @@ def decode_new_pipeline(payload: bytes, orig_len: int, meta: Dict[str, Any]) -> 
             Uj = unpack_bits_from_bytes(buf, L)
             planes.append(Uj)
         else:
-            # ENCODED plane: read Rice from current bitpos until sum==L; then align to next byte
-            k = next(k_iter)
+            k  = next(k_it)
             b1 = (b1_mask >> j) & 1
             br = _BitReader(data, data_pos, 0)
             runs = _rice_decode_until_len(br, k, L)
-            # align to next byte for the next plane
             br.align_next_byte()
-            data_pos, _bit = br.tell()
-            # rebuild plane bits
-            Lj_bits = unrle_binary(b1, runs)
-            Uj_bytes = bbwt_inverse(bytes(Lj_bits))
+            data_pos, _ = br.tell()
+
+            Lj_bits = unrle_binary(b1, runs)           # len L, elements 0/1
+            Uj_bytes = bbwt_inverse(bytes(Lj_bits))    # bytes of 0/1
             Uj = list(Uj_bytes)
             if len(Uj) != L:
                 Uj = Uj[:L] if len(Uj) > L else (Uj + [0] * (L - len(Uj)))
             planes.append(Uj)
 
-    # Recombine planes -> bytes, then invert circuit automaton
     mapped = bitplanes_to_bytes(planes)
-    block  = circuit_map_automaton_inverse(mapped, {"mode": mode})
-    return block
+    # Pass mode_param through (ignored by current inverse, but future-proof)
+    return circuit_map_automaton_inverse(mapped, {"mode": mode, "param": mode_param, "mode_param": mode_param})
 
 def nibble_swap(data: bytes) -> bytes:
     """Swap the high and low 4‑bit nibbles of each byte."""
@@ -1943,18 +2150,18 @@ def _unpack_mode_and_size(word: int) -> Tuple[int, int]:
 # V2 removes the invalid pipelines (BBWT with LFSR mixing) and introduces a new pipeline ``encode_new_pipeline``.  
 # Each candidate returns a payload and metadata; the smallest payload is selected for each block.
 def _select_encoders() -> List[Tuple[Callable[[bytes], Tuple[bytes, Dict[str, Any]]], str]]:
-    all_list: List[Tuple[Callable[[bytes], Tuple[bytes, Dict[str, Any]]], str]] = [
+    all_list = [
         (encode_raw, 'raw'),
         (encode_xor, 'xor'),
-        (lambda b: encode_bbwt_mtf_rice(b, False, False, False, False, False, rice_param=2), 'bbwt'),
-        (lambda b: encode_bbwt_mtf_rice(b, True,  False, False, False, False, rice_param=2), 'bbwt_bp'),
-        (lambda b: encode_bbwt_mtf_rice(b, False, False, True,  False, False, rice_param=2), 'bbwt_nib'),
-        (lambda b: encode_bbwt_mtf_rice(b, False, False, False, True,  False, rice_param=2), 'bbwt_br'),
-        (lambda b: encode_bbwt_mtf_rice(b, False, False, False, False, True,  rice_param=2), 'bbwt_gray'),
+        (lambda block: encode_bbwt_mtf_rice(block, False, False, False, False, False, rice_param=2), 'bbwt'),
+        (lambda block: encode_bbwt_mtf_rice(block, True,  False, False, False, False, rice_param=2), 'bbwt_bp'),
+        (lambda block: encode_bbwt_mtf_rice(block, False, False, True,  False, False, rice_param=2), 'bbwt_nib'),
+        (lambda block: encode_bbwt_mtf_rice(block, False, False, False, True,  False, rice_param=2), 'bbwt_br'),
+        (lambda block: encode_bbwt_mtf_rice(block, False, False, False, False, True,  rice_param=2), 'bbwt_gray'),
         (encode_lz77, 'lz77'),
         (encode_lfsr_predict, 'lfsr_pred'),
         (repair_compress, 'repair'),
-        (encode_new_pipeline, 'v2_new'),
+        (lambda block: (encode_new_pipeline(block), {}), 'v2_new'),
     ]
 
     # 过滤 LZ77
@@ -1988,15 +2195,15 @@ def _select_decoders() -> List[Callable[[bytes, int, Dict[str, Any]], bytes]]:
     return [
         decode_raw,
         decode_xor,
-        lambda p, l, meta=None: decode_bbwt_mtf_rice(p, {"flags": 0,  "k": 2, "length": l, "orig_len": l}),
-        lambda p, l, meta=None: decode_bbwt_mtf_rice(p, {"flags": 1,  "k": 2, "length": l, "orig_len": l}),
-        lambda p, l, meta=None: decode_bbwt_mtf_rice(p, {"flags": 4,  "k": 2, "length": l, "orig_len": l}),
-        lambda p, l, meta=None: decode_bbwt_mtf_rice(p, {"flags": 8,  "k": 2, "length": l, "orig_len": l}),
-        lambda p, l, meta=None: decode_bbwt_mtf_rice(p, {"flags": 16, "k": 2, "length": l, "orig_len": l}),
-        lambda p, l, meta=None: decode_lz77(p, l),
-        lambda p, l, meta=None: decode_lfsr_predict(p, l),
-        lambda p, l, meta=None: repair_decompress(p, l),
-        decode_new_pipeline,
+        lambda payload, byte_length, meta=None: decode_bbwt_mtf_rice(payload, {"flags": 0,  "k": 2, "length": byte_length, "orig_len": byte_length}),
+        lambda payload, byte_length, meta=None: decode_bbwt_mtf_rice(payload, {"flags": 1,  "k": 2, "length": byte_length, "orig_len": byte_length}),
+        lambda payload, byte_length, meta=None: decode_bbwt_mtf_rice(payload, {"flags": 4,  "k": 2, "length": byte_length, "orig_len": byte_length}),
+        lambda payload, byte_length, meta=None: decode_bbwt_mtf_rice(payload, {"flags": 8,  "k": 2, "length": byte_length, "orig_len": byte_length}),
+        lambda payload, byte_length, meta=None: decode_bbwt_mtf_rice(payload, {"flags": 16, "k": 2, "length": byte_length, "orig_len": byte_length}),
+        lambda payload, byte_length, meta=None: decode_lz77(payload, byte_length),
+        lambda payload, byte_length, meta=None: decode_lfsr_predict(payload, byte_length),
+        lambda payload, byte_length, meta=None: repair_decompress(payload, byte_length),
+        lambda payload, byte_length, meta=None: decode_new_pipeline(payload, byte_length),
     ]
 
 # =========================================

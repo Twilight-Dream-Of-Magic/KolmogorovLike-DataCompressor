@@ -23,7 +23,7 @@
 // -----------------------------
 // C++ language utilities / type traits
 // -----------------------------
-#include <bit>            // C++20: std::bit_width
+#include <bit>			// C++20: std::bit_width
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -72,6 +72,12 @@
 // Error handling / exceptions / misc
 // -----------------------------
 #include <stdexcept>
+
+// -----------------------------------------
+// Threading
+// -----------------------------------------
+#include <thread>
+#include <future>
 
 // --no-lz77
 static bool G_NO_LZ77 = false;
@@ -504,41 +510,6 @@ std::vector<std::uint8_t> lfsr_whiten( const std::vector<std::uint8_t>& data, st
 std::vector<std::uint8_t> nibble_swap( const std::vector<std::uint8_t>& data );
 std::vector<std::uint8_t> bit_reverse( const std::vector<std::uint8_t>& data );
 
-// Boolean gate primitives and automata
-std::uint8_t gate_and( std::uint8_t a, std::uint8_t b )
-{
-	return a & b;
-}
-std::uint8_t gate_or( std::uint8_t a, std::uint8_t b )
-{
-	return a | b;
-}
-std::uint8_t gate_not( std::uint8_t a, std::uint8_t width = 8 );
-std::uint8_t gate_xor( std::uint8_t a, std::uint8_t b, std::uint8_t width = 8 );
-// prefix_or_word and left_band helpers have been removed as they were unused.
-std::uint8_t byte_eq( std::uint8_t a, std::uint8_t b );
-std::uint8_t mux_byte( std::uint8_t m, std::uint8_t a, std::uint8_t b, std::uint8_t width = 8 );
-std::uint8_t gray_pred( std::uint8_t v );
-
-// Four automaton modes and selection
-std::vector<std::uint8_t> mode1_forward( const std::vector<std::uint8_t>& block );
-std::vector<std::uint8_t> mode1_inverse( const std::vector<std::uint8_t>& residual );
-std::vector<std::uint8_t> mode2_forward( const std::vector<std::uint8_t>& block );
-std::vector<std::uint8_t> mode2_inverse( const std::vector<std::uint8_t>& residual );
-std::vector<std::uint8_t> mode3_forward( const std::vector<std::uint8_t>& block );
-std::vector<std::uint8_t> mode3_inverse( const std::vector<std::uint8_t>& residual );
-std::vector<std::uint8_t> mode4_forward( const std::vector<std::uint8_t>& block );
-std::vector<std::uint8_t> mode4_inverse( const std::vector<std::uint8_t>& residual );
-
-// Circuit automaton selector
-struct AutomatonResult
-{
-	std::vector<std::uint8_t> data;
-	std::uint8_t			  mode;
-};
-AutomatonResult			  circuit_map_automaton_forward( const std::vector<std::uint8_t>& block );
-std::vector<std::uint8_t> circuit_map_automaton_inverse( const std::vector<std::uint8_t>& mapped, std::uint8_t mode );
-
 // Helper functions for bit‑plane conversion and run‑length coding
 std::tuple<std::vector<std::vector<int>>, std::size_t> bytes_to_bitplanes( const std::vector<std::uint8_t>& data );
 std::vector<std::uint8_t>							   bitplanes_to_bytes( const std::vector<std::vector<int>>& planes );
@@ -633,10 +604,6 @@ ByteVector decompress( const ByteVector& container );
 //   10: V2 new pipeline
 // -----------------------------------------
 
-// Minimal public aliases
-using ByteVector = std::vector<std::uint8_t>;
-using MetaMap = std::unordered_map<std::string, std::string>;
-
 // -----------------------------------------------------------------------------
 // Implementation
 //
@@ -695,18 +662,22 @@ std::pair<std::uint64_t, std::size_t> uleb128_decode_stream( const std::vector<s
 
 // ============================================================
 // Deterministic GEAR table (xorshift32, OR 1 to avoid zeros)
+// Paper reference:
+//   Wen Xia et al. "Design of Fast Content-Defined Chunking
+//   for Data Deduplication-Based Storage Systems",
+//   IEEE TPDS, 2020. (FastCDC)
 // ============================================================
 std::array<std::uint32_t, 256> make_gear( std::uint32_t seed ) noexcept
 {
 	std::array<std::uint32_t, 256> tbl {};
-	std::uint32_t				   x = seed;
+	std::uint32_t				  x = seed;
 	for ( std::size_t i = 0; i < tbl.size(); ++i )
 	{
 		// xorshift32, identical bit-twiddling to the Python version
 		x ^= ( x << 13 );
 		x ^= ( x >> 17 );
 		x ^= ( x << 5 );
-		tbl[ i ] = ( x | 1u );	// ensure non-zero
+		tbl[ i ] = ( x | 1u );   // ensure non-zero
 	}
 	return tbl;
 }
@@ -721,8 +692,10 @@ std::uint32_t clamp_mask_bits( std::size_t avg_size ) noexcept
 {
 	if ( avg_size == 0 )
 		return 6u;
+
 	// bit_length(x) - 1 == floor(log2(x))
-	unsigned k = ( std::bit_width( avg_size ) == 0 ? 0u : static_cast<unsigned>( std::bit_width( avg_size ) - 1 ) );
+	unsigned k = ( std::bit_width( avg_size ) == 0 ? 0u
+												   : static_cast<unsigned>( std::bit_width( avg_size ) - 1 ) );
 	if ( k < 6u )
 		k = 6u;
 	if ( k > 20u )
@@ -732,66 +705,154 @@ std::uint32_t clamp_mask_bits( std::size_t avg_size ) noexcept
 
 std::uint32_t roll_gear( std::uint32_t h, std::uint8_t byte_val ) noexcept
 {
-	// ((h << 1) & 0xFFFFFFFF) + GEAR[byte_val]
-	// Using uint32_t arithmetic naturally wraps mod 2^32.
-	return static_cast<std::uint32_t>( ( h << 1 ) ) + GEAR[ byte_val ];
+	// fp' = (fp << 1) + Gear[byte]; uint32_t arithmetic wraps modulo 2^32.
+	return static_cast<std::uint32_t>( h << 1 ) + GEAR[ byte_val ];
+}
+
+// Build a contiguous low-bit mask with `bits` ones.
+//
+// This is a 32-bit analogue of the 64-bit masks MaskS/MaskA/MaskL in FastCDC.
+// For boundary probability, only the number of '1' bits matters when the
+// fingerprint behaves like a random word; the exact bit positions are not
+// important for our use here.
+static inline std::uint32_t make_low_mask( unsigned bits ) noexcept
+{
+	if ( bits == 0 )
+		return 0u;
+	if ( bits >= 32 )
+		return 0xFFFFFFFFu;
+	return ( 1u << bits ) - 1u;
 }
 
 // =========================================
-// FastCDC (strict, non-recursive)
+// FastCDC-style CDC with normalized chunking
+//
+// Generalized from Algorithm 2 "FastCDC8KB (with NC)" in
+// Wen Xia et al., IEEE TPDS 2020.
+//
+// - Uses three masks: MaskS / MaskA / MaskL
+//   * MaskA: baseline mask (not used directly here, kept for clarity)
+//   * MaskS: stronger mask (more '1' bits) before NormalSize
+//   * MaskL: looser mask (fewer '1' bits) after NormalSize
+// - Two-phase scan per chunk:
+//   * [min_size, NormalSize): use MaskS to suppress very small chunks
+//   * [NormalSize, max_size]: use MaskL to cut oversized chunks earlier
 // =========================================
-BoundaryList cdc_fast_boundaries_strict( const std::vector<std::uint8_t>& data, std::size_t min_size, std::size_t avg_size, std::size_t max_size, bool merge_orphan_tail )
+BoundaryList cdc_fast_boundaries_strict(
+	const std::vector<std::uint8_t>& data,
+	std::size_t					  min_size,
+	std::size_t					  avg_size,
+	std::size_t					  max_size,
+	bool							 merge_orphan_tail )
 {
 	const std::size_t n = data.size();
 	if ( n == 0 )
 		return {};
 
-	// Validate constraints: 0 < min_size ≤ avg_size ≤ max_size and avg_size ≥ 64
+	// Validate constraints: 0 < min_size <= avg_size <= max_size and avg_size >= 64
 	if ( !( min_size > 0 && min_size <= avg_size && avg_size <= max_size ) )
 	{
-		throw std::invalid_argument( "Require 0 < min_size \342\211\245 avg_size \342\211\245 max_size" );
+		throw std::invalid_argument( "Require 0 < min_size <= avg_size <= max_size" );
 	}
 	if ( avg_size < 64 )
 	{
-		throw std::invalid_argument( "avg_size too small; use \342\211\245 64" );
+		throw std::invalid_argument( "avg_size too small; use >= 64" );
 	}
 
-	const std::uint32_t k = clamp_mask_bits( avg_size );
-	const std::uint32_t mask = ( 1u << k ) - 1u;
+	// Derive base mask bits from avg_size (same idea as in the paper: probability
+	// ~ 1 / 2^k, with k clamped to [6, 20]).
+	const std::uint32_t k	 = clamp_mask_bits( avg_size );
+	const std::uint32_t k_str = ( k + 2u <= 20u ? k + 2u : 20u ); // stronger mask (more '1' bits)
+	const std::uint32_t k_lo  = ( k > 2u ? k - 2u : 1u );		 // looser mask (fewer '1' bits)
+
+	const std::uint32_t mask_a = make_low_mask( k );	  // MaskA: baseline
+	const std::uint32_t mask_s = make_low_mask( k_str );  // MaskS: early region
+	const std::uint32_t mask_l = make_low_mask( k_lo );   // MaskL: late region
+
+	(void)mask_a; // MaskA kept for completeness; not used in NC mode.
 
 	BoundaryList boundaries;
-	boundaries.reserve( std::max<std::size_t>( 1, n / std::max<std::size_t>( 1, avg_size ) ) );
+	boundaries.reserve(
+		std::max<std::size_t>( 1, n / std::max<std::size_t>( std::size_t( 1 ), avg_size ) ) );
 
 	std::size_t i = 0;
 	while ( i < n )
 	{
-		const std::size_t start = i;
-		const std::size_t end_min = std::min( n, start + min_size );
-		const std::size_t end_max = std::min( n, start + max_size );
+		const std::size_t start	 = i;
+		const std::size_t remaining = n - start;
 
-		i = end_min;
-		std::uint32_t h = 0;
+		// Algorithm 2: "if n <= MinSize then return n".
+		// For the last tail shorter than or equal to min_size, emit as one chunk.
+		if ( remaining <= min_size )
+		{
+			boundaries.emplace_back( start, n );
+			i = n;
+			break;
+		}
+
+		// Effective maximum length allowed for this chunk.
+		const std::size_t local_max = std::min<std::size_t>( remaining, max_size );
+
+		// NormalSize in FastCDC8KB is the expected size (8KB) but clamped by n.
+		// Here we generalize it to avg_size under the same rule.
+		std::size_t normal_size = avg_size;
+		if ( local_max < normal_size )
+			normal_size = local_max;
+
+		// Region boundaries in the global index space.
+		const std::size_t end_min	= start + min_size;   // we never cut before this
+		const std::size_t end_normal = start + normal_size; // upper bound for MaskS region
+		const std::size_t end_limit  = start + local_max;  // hard upper bound for this chunk
+
+		std::size_t   pos   = end_min;
+		std::uint32_t fp	= 0;
 		bool		  found = false;
 
-		while ( i < end_max )
+		// Phase 1: [min_size, NormalSize) using MaskS.
+		// This suppresses very small chunks by making the cut condition harder.
+		while ( pos < end_normal && pos < end_limit )
 		{
-			h = roll_gear( h, data[ i ] );
-			if ( ( h & mask ) == 0u )
+			fp = roll_gear( fp, data[ pos ] );
+			if ( ( fp & mask_s ) == 0u )
 			{
-				++i;
+				// Cut just after this byte so that the boundary is inclusive.
+				++pos;
 				found = true;
 				break;
 			}
-			++i;
+			++pos;
 		}
+
+		// Phase 2: [NormalSize, MaxSize] using MaskL.
+		// If nothing was cut in Phase 1, we gradually increase the probability
+		// of a cut to avoid oversized chunks.
 		if ( !found )
 		{
-			i = end_max;  // forced split
+			while ( pos < end_limit )
+			{
+				fp = roll_gear( fp, data[ pos ] );
+				if ( ( fp & mask_l ) == 0u )
+				{
+					++pos;
+					found = true;
+					break;
+				}
+				++pos;
+			}
 		}
-		boundaries.emplace_back( start, i );
+
+		// If still no boundary found, force a cut at MaxSize.
+		if ( !found )
+		{
+			pos = end_limit;
+		}
+
+		boundaries.emplace_back( start, pos );
+		i = pos;
 	}
 
-	// Merge orphan tail if enabled and the last block is smaller than min_size
+	// Merge orphan tail (optional): if the very last chunk is smaller than
+	// min_size, merge it into the previous one to keep a cleaner size profile.
 	if ( merge_orphan_tail && boundaries.size() >= 2 )
 	{
 		const auto [ last_s, last_e ] = boundaries.back();
@@ -810,6 +871,7 @@ BoundaryList cdc_fast_boundaries_strict( const std::vector<std::uint8_t>& data, 
 
 	return boundaries;
 }
+
 
 // =========================================
 // Fixed-size chunking
@@ -1271,17 +1333,31 @@ std::vector<std::uint8_t> bit_reverse( const std::vector<std::uint8_t>& data )
 	return out;
 }
 
-// Gate NOT limited to a specific bit‑width.  We mask the complement so that
-// only the lowest width bits are retained (two's complement semantics).
-std::uint8_t gate_not( std::uint8_t a, std::uint8_t width )
+// ------------------------------- Boolean circuit gates and primitives  -------------------------------
+
+// Boolean gate primitives and automata
+std::uint8_t gate_and( std::uint8_t a, std::uint8_t b )
 {
-	std::uint8_t lane_mask = static_cast<std::uint8_t>( ( 1u << width ) - 1u );
-	return static_cast<std::uint8_t>( ( ~a ) & lane_mask );
+	return a & b;
+}
+std::uint8_t gate_or( std::uint8_t a, std::uint8_t b )
+{
+	return a | b;
 }
 
-// Gate XOR expressed in terms of OR, AND and NOT.  We mask intermediate
-// results to prevent overflow outside the active lane.  See Python comment
-// for derivation: XOR = (a OR b) AND NOT(a AND b).
+// Gate NOT limited to a specific bit‑width. 
+// We mask the complement so that only the lowest width bits are retained (two's complement semantics).
+std::uint8_t gate_not( std::uint8_t a, std::uint8_t width )
+{
+	width = ( width > 8 ) ? 8 : width;
+	const std::uint32_t one = std::uint32_t( 1 );
+	const std::uint32_t lane_mask = ( width == 0 ) ? std::uint32_t( 0 ) : ( ( one << width ) - std::uint32_t( 1 ) );
+	return std::uint8_t( ( ~a ) & lane_mask );
+}
+
+// Gate XOR expressed in terms of OR, AND and NOT. 
+// We mask intermediate results to prevent overflow outside the active lane.
+// See Python comment for derivation: XOR = (a OR b) AND NOT(a AND b).
 std::uint8_t gate_xor( std::uint8_t a, std::uint8_t b, std::uint8_t width )
 {
 	std::uint8_t or_result = static_cast<std::uint8_t>( a | b );
@@ -1290,355 +1366,661 @@ std::uint8_t gate_xor( std::uint8_t a, std::uint8_t b, std::uint8_t width )
 	return static_cast<std::uint8_t>( or_result & not_and );
 }
 
-// prefix_or_word and left_band implementations have been removed because they were unused.
-
-// Branch‑free byte equality: returns 0xFF if a == b else 0x00.  Based on
-// gate logic: compute x = a XOR b, reduce to a single bit any_one, invert
-// this bit to get equality and replicate across the lane.
-std::uint8_t byte_eq( std::uint8_t a, std::uint8_t b )
+// branch-free byte equality -> 0xFF if equal else 0x00
+std::uint8_t byte_equal_mask(std::uint8_t a, std::uint8_t b)
 {
-	std::uint8_t width = 8;
-	std::uint8_t lane_mask = static_cast<std::uint8_t>( ( 1u << width ) - 1u );
-	// x = a XOR b within the lane.
-	std::uint8_t x = gate_xor( static_cast<std::uint8_t>( a & lane_mask ), static_cast<std::uint8_t>( b & lane_mask ), width );
-	// OR‑fold to detect any set bit.
-	std::uint8_t x1 = static_cast<std::uint8_t>( x | ( ( x >> 4 ) & 0x0Fu ) );
-	x1 = static_cast<std::uint8_t>( x1 | ( ( x1 >> 2 ) & 0x3Fu ) );
-	x1 = static_cast<std::uint8_t>( x1 | ( ( x1 >> 1 ) & 0x7Fu ) );
-	std::uint8_t any_one = static_cast<std::uint8_t>( x1 & 1u );
-	// eq_bit = NOT(any_one) in a 1‑bit lane.
-	std::uint8_t eq_bit = static_cast<std::uint8_t>( gate_not( any_one, 1 ) & 1u );
-	// Replicate eq_bit across all bits of a byte.
-	std::uint8_t mask = 0;
-	for ( int i = 0; i < 8; ++i )
+	std::uint8_t x = gate_xor(a, b, 8);
+	x = (x | (x >> 4));
+	x = (x | (x >> 2));
+	x = (x | (x >> 1));
+
+	std::uint8_t any_bit1 = static_cast<std::uint8_t>(x & std::uint8_t(1));
+	std::uint8_t equal_bit1 = gate_not(any_bit1, 1);
+
+	//spread 1-bit to OxFF
+	equal_bit1 = (equal_bit1 | (equal_bit1 << 1));
+	equal_bit1 = (equal_bit1 | (equal_bit1 << 2));
+	equal_bit1 = (equal_bit1 | (equal_bit1 << 4));
+	return equal_bit1;
+}
+
+// 2-to-1 byte multiplexer (bitwise): for each bit, choose from 'a' where mask bit=1, else from 'b'.
+std::uint8_t mux_mask(std::uint8_t mask_ff, std::uint8_t a, std::uint8_t b)
+{
+	return static_cast<std::uint8_t>( ( a & mask_ff ) | ( b & gate_not( mask_ff, 8 ) ) );
+}
+
+// Gray(v) = v XOR (v >> 1) (still via gates)
+std::uint8_t gray_code( std::uint8_t v, std::uint8_t width )
+{
+	return gate_xor( v, static_cast<std::uint8_t>( v >> 1 ), width );
+}
+
+// Majority of 3 function: majority(a,b,c) = (a AND b) OR (a AND c) OR (b AND c)
+std::uint8_t gate_majority_3( std::uint8_t a, std::uint8_t b, std::uint8_t c )
+{
+	std::uint8_t ab = gate_and( a, b );
+	std::uint8_t ac = gate_and( a, c );
+	std::uint8_t bc = gate_and( b, c );
+	std::uint8_t abc = gate_or( ab, ac );
+	return gate_or( abc, bc );
+}
+
+// Morphology block (all gates)
+std::uint8_t spread_left1( std::uint8_t x )
+{
+	return std::uint8_t( ( ( std::uint8_t( x << 1 ) & std::uint8_t( 0xFE ) ) | x ) );
+}
+
+std::uint8_t spread_right1( std::uint8_t x )
+{
+	return std::uint8_t( ( ( std::uint8_t( x >> 1 ) & std::uint8_t( 0x7F ) ) | x ) );
+}
+
+std::uint8_t dilate1( std::uint8_t x )
+{
+	return static_cast<std::uint8_t>( spread_left1( x ) | spread_right1( x ) );
+}
+
+std::uint8_t erode1( std::uint8_t x )
+{
+	return static_cast<std::uint8_t>( ~dilate1( static_cast<std::uint8_t>( ~x ) ) );
+}
+
+std::uint8_t close1(std::uint8_t x)
+{
+	return erode1( dilate1( x ) );
+}
+
+std::uint8_t open1(std::uint8_t x)
+{
+	return dilate1( erode1( x ) );
+}
+
+std::uint8_t edge1(std::uint8_t x)
+{
+	return static_cast<std::uint8_t>( dilate1( x ) ^ erode1( x ) );
+}
+
+// ------------------------------- Zero-order entropy (scoring only) --------------------
+// Compute 0th‑order entropy of a byte array.  
+// Used by the automaton selector.
+double zero_order_entropy_bits_per_byte( const std::vector<std::uint8_t>& data )
+{
+	if ( data.empty() )
+		return 0.0;
+	std::uint64_t freq[ 256 ] = { 0 };
+	for ( std::uint8_t v : data )
+		freq[ v ]++;
+
+	const double n = static_cast<double>( data.size() );
+	double		 H = 0.0;
+	// a tiny unrolled walk to avoid a loop-of-candidates (this is per-byte loop; allowed)
+	for ( int i = 0; i < 256; ++i )
 	{
-		mask |= static_cast<std::uint8_t>( ( eq_bit << i ) & 0xFFu );
-	}
-	return mask;
-}
-
-// 2:1 multiplexer on a byte lane.  Canonical masks are 0xFF (select a) or
-// 0x00 (select b).  Non‑canonical masks are supported but may blend bits.
-std::uint8_t mux_byte( std::uint8_t m, std::uint8_t a, std::uint8_t b, std::uint8_t width )
-{
-	return static_cast<std::uint8_t>( ( ( m & a ) | ( gate_not( m, width ) & b ) ) & ( ( 1u << width ) - 1u ) );
-}
-
-// Gray predictor: compute g = v XOR (v >> 1).  Use gate_xor to preserve lane.
-std::uint8_t gray_pred( std::uint8_t v )
-{
-	return gate_xor( v, static_cast<std::uint8_t>( v >> 1 ), 8 );
-}
-
-// Mode 1 forward: order‑1 residual (y[i] = x[i] XOR x[i‑1]).  The first
-// symbol seeds the recursion.
-std::vector<std::uint8_t> mode1_forward( const std::vector<std::uint8_t>& block )
-{
-	if ( block.empty() )
-		return {};
-	std::size_t				  length = block.size();
-	std::vector<std::uint8_t> out( length );
-	out[ 0 ] = block[ 0 ];
-	for ( std::size_t i = 1; i < length; ++i )
-	{
-		out[ i ] = gate_xor( block[ i ], block[ i - 1 ], 8 );
-	}
-	return out;
-}
-
-// Mode 1 inverse: reconstruct x from residuals and history.
-std::vector<std::uint8_t> mode1_inverse( const std::vector<std::uint8_t>& residual )
-{
-	if ( residual.empty() )
-		return {};
-	std::size_t				  length = residual.size();
-	std::vector<std::uint8_t> out( length );
-	out[ 0 ] = residual[ 0 ];
-	for ( std::size_t i = 1; i < length; ++i )
-	{
-		out[ i ] = gate_xor( residual[ i ], out[ i - 1 ], 8 );
-	}
-	return out;
-}
-
-// Mode 2 forward: Gray predictor residual (y[i] = x[i] XOR Gray(x[i‑1])).
-std::vector<std::uint8_t> mode2_forward( const std::vector<std::uint8_t>& block )
-{
-	if ( block.empty() )
-		return {};
-	std::size_t				  length = block.size();
-	std::vector<std::uint8_t> out( length );
-	out[ 0 ] = block[ 0 ];
-	for ( std::size_t i = 1; i < length; ++i )
-	{
-		std::uint8_t predictor = gray_pred( block[ i - 1 ] );
-		out[ i ] = gate_xor( block[ i ], predictor, 8 );
-	}
-	return out;
-}
-
-// Mode 2 inverse: recover original bytes using Gray predictor from decoded history.
-std::vector<std::uint8_t> mode2_inverse( const std::vector<std::uint8_t>& residual )
-{
-	if ( residual.empty() )
-		return {};
-	std::size_t				  length = residual.size();
-	std::vector<std::uint8_t> out( length );
-	out[ 0 ] = residual[ 0 ];
-	for ( std::size_t i = 1; i < length; ++i )
-	{
-		std::uint8_t predictor = gray_pred( out[ i - 1 ] );
-		out[ i ] = gate_xor( residual[ i ], predictor, 8 );
-	}
-	return out;
-}
-
-// Mode 3 forward: order‑2 residual: y[0] = x[0], y[1] = x[1] XOR x[0],
-// for i≥2: y[i] = x[i] XOR x[i‑2].
-std::vector<std::uint8_t> mode3_forward( const std::vector<std::uint8_t>& block )
-{
-	std::size_t length = block.size();
-	if ( length == 0 )
-		return {};
-	if ( length == 1 )
-		return { block[ 0 ] };
-	std::vector<std::uint8_t> out( length );
-	out[ 0 ] = block[ 0 ];
-	out[ 1 ] = gate_xor( block[ 1 ], block[ 0 ], 8 );
-	for ( std::size_t i = 2; i < length; ++i )
-	{
-		out[ i ] = gate_xor( block[ i ], block[ i - 2 ], 8 );
-	}
-	return out;
-}
-
-// Mode 3 inverse: invert order‑2 residual by reconstructing from history.
-std::vector<std::uint8_t> mode3_inverse( const std::vector<std::uint8_t>& residual )
-{
-	std::size_t length = residual.size();
-	if ( length == 0 )
-		return {};
-	if ( length == 1 )
-		return { residual[ 0 ] };
-	std::vector<std::uint8_t> out( length );
-	out[ 0 ] = residual[ 0 ];
-	out[ 1 ] = gate_xor( residual[ 1 ], out[ 0 ], 8 );
-	for ( std::size_t i = 2; i < length; ++i )
-	{
-		out[ i ] = gate_xor( residual[ i ], out[ i - 2 ], 8 );
-	}
-	return out;
-}
-
-// Mode 4 forward: run‑segment selector.  For i>=2 choose predictor = x[i‑1]
-// (if x[i‑1]==x[i‑2]) else Gray(x[i‑1]).  Residual is XOR with predictor.
-std::vector<std::uint8_t> mode4_forward( const std::vector<std::uint8_t>& block )
-{
-	std::size_t length = block.size();
-	if ( length == 0 )
-		return {};
-	if ( length == 1 )
-		return { block[ 0 ] };
-	std::vector<std::uint8_t> out( length );
-	out[ 0 ] = block[ 0 ];
-	out[ 1 ] = gate_xor( block[ 1 ], block[ 0 ], 8 );
-	for ( std::size_t i = 2; i < length; ++i )
-	{
-		std::uint8_t selector_mask = byte_eq( block[ i - 1 ], block[ i - 2 ] );
-		std::uint8_t pred_run = block[ i - 1 ];
-		std::uint8_t pred_alt = gray_pred( block[ i - 1 ] );
-		std::uint8_t predictor = mux_byte( selector_mask, pred_run, pred_alt );
-		out[ i ] = gate_xor( block[ i ], predictor, 8 );
-	}
-	return out;
-}
-
-// Mode 4 inverse: recompute predictor from already decoded bytes.
-std::vector<std::uint8_t> mode4_inverse( const std::vector<std::uint8_t>& residual )
-{
-	std::size_t length = residual.size();
-	if ( length == 0 )
-		return {};
-	if ( length == 1 )
-		return { residual[ 0 ] };
-	std::vector<std::uint8_t> out( length );
-	out[ 0 ] = residual[ 0 ];
-	out[ 1 ] = gate_xor( residual[ 1 ], out[ 0 ], 8 );
-	for ( std::size_t i = 2; i < length; ++i )
-	{
-		std::uint8_t selector_mask = byte_eq( out[ i - 1 ], out[ i - 2 ] );
-		std::uint8_t pred_run = out[ i - 1 ];
-		std::uint8_t pred_alt = gray_pred( out[ i - 1 ] );
-		std::uint8_t predictor = mux_byte( selector_mask, pred_run, pred_alt );
-		out[ i ] = gate_xor( residual[ i ], predictor, 8 );
-	}
-	return out;
-}
-
-// Select the best reversible automaton by minimum 0th‑order entropy.  Modes
-// considered: identity (0), mode1, mode2, mode3, mode4.  Ties favour
-// smaller mode index to ensure deterministic behaviour.  Returns both
-// transformed data and the chosen mode identifier.
-AutomatonResult circuit_map_automaton_forward( const std::vector<std::uint8_t>& block )
-{
-	double					  best_entropy = zero_order_entropy( block );
-	std::uint8_t			  best_mode = 0;
-	std::vector<std::uint8_t> best_bytes = block;
-	// Candidates for modes 1..4.
-	std::vector<std::pair<std::uint8_t, std::vector<std::uint8_t>>> candidates;
-	candidates.emplace_back( 1, mode1_forward( block ) );
-	candidates.emplace_back( 2, mode2_forward( block ) );
-	candidates.emplace_back( 3, mode3_forward( block ) );
-	candidates.emplace_back( 4, mode4_forward( block ) );
-	for ( const auto& [ mode_id, mapped ] : candidates )
-	{
-		double ent = zero_order_entropy( mapped );
-		if ( ent < best_entropy - 1e-9 || ( std::abs( ent - best_entropy ) <= 1e-9 && mode_id < best_mode ) )
+		if ( freq[ i ] )
 		{
-			best_entropy = ent;
-			best_mode = mode_id;
-			best_bytes = mapped;
+			double p = freq[ i ] / n;
+			H -= p * std::log2( p );
 		}
 	}
-	return { best_bytes, best_mode };
+	// bits/symbol == bits/byte here (8-bit alphabet)
+	return H;
 }
 
-// Inverse of the selected automaton.  Given the mode id, dispatch to the
-// appropriate inverse function.  Unknown modes fall back to identity.
-std::vector<std::uint8_t> circuit_map_automaton_inverse( const std::vector<std::uint8_t>& mapped, std::uint8_t mode )
+// ------------------------------- Model Interface --------------------------------------
+struct TransformChoice
 {
-	switch ( mode )
+	std::vector<std::uint8_t> transform_bytes;	 // bytes representing the transform
+	double					  H0_bits_per_byte;	 // estimated 0th-order bit entropy after transform
+	std::uint8_t			  model_code;		 // 1..5
+	std::uint32_t			  param_code;		 // parameter code (meaning depends on model) e.g : k, variant, mask, etc.
+	std::string				  model_name;		 // human-readable model name
+};
+
+class IBooleanCircuitModel
+{
+public:
+	virtual ~IBooleanCircuitModel() = default;
+	virtual std::string				  name() const = 0;
+	virtual std::vector<std::uint8_t> forward( const std::vector<std::uint8_t>& raw, std::uint32_t param_code ) const = 0;
+	virtual std::vector<std::uint8_t> backward( const std::vector<std::uint8_t>& residual, std::uint32_t param_code ) const = 0;
+};
+
+// ------------------------------- Model 1: Delta-k family ------------------------------
+
+class ModelDeltaK final : public IBooleanCircuitModel
+{
+public:
+	std::string name() const override
 	{
-	case 0:
-		return mapped;
-	case 1:
-		return mode1_inverse( mapped );
-	case 2:
-		return mode2_inverse( mapped );
-	case 3:
-		return mode3_inverse( mapped );
-	case 4:
-		return mode4_inverse( mapped );
+		return "Model-1: Delta-k";
+	}
+
+	std::vector<std::uint8_t> forward( const std::vector<std::uint8_t>& raw, std::uint32_t param_k ) const override
+	{
+		if (param_k == 0) 
+			return raw;
+		const std::size_t raw_size = raw.size();
+		std::vector<std::uint8_t> residual(raw_size, 0);
+		if(!raw_size)
+			return residual;
+		for(std::size_t index = 0; index < raw_size; ++index)
+		{
+			residual[index] = (index < param_k) ? raw[index] : gate_xor(raw[index], raw[index - param_k], 8);
+		}
+		return residual;
+	}
+
+	std::vector<std::uint8_t> backward( const std::vector<std::uint8_t>& residual, std::uint32_t param_k ) const override
+	{
+		if (param_k == 0) 
+			return residual;
+		const std::size_t residual_size = residual.size();
+		std::vector<std::uint8_t> raw(residual_size, 0);
+		if(!residual_size)
+			return raw;
+		for(std::size_t index = 0; index < residual_size; ++index)
+		{
+			raw[index] = (index < param_k) ? residual[index] : gate_xor(residual[index], raw[index - param_k], 8);
+		}
+		return raw;
+	}
+};
+
+// ------------------------------- Model 2: Gray family ---------------------------------
+
+enum class GrayVariant : uint8_t
+{
+	G1 = 0,
+	G2 = 1,
+	GX = 2,
+	GO = 3
+};
+
+class ModelGrayFamily final : public IBooleanCircuitModel
+{
+public:
+	std::string name() const override
+	{
+		return "Model-2: Gray family";
+	}
+
+	std::vector<std::uint8_t> forward( const std::vector<std::uint8_t>& raw, std::uint32_t param_code ) const override
+	{
+		GrayVariant				  variant = static_cast<GrayVariant>( param_code & std::uint32_t(0x03) );
+		const std::size_t		  raw_size = raw.size();
+		std::vector<std::uint8_t> residual( raw_size, 0 );
+		if ( !raw_size )
+			return residual;
+
+		residual[ 0 ] = raw[ 0 ];
+		if ( raw_size == 1 )
+			return residual;
+		residual[ 1 ] = gate_xor( raw[ 1 ], raw[ 0 ], 8 );
+		for ( std::size_t index = 2; index < raw_size; ++index )
+		{
+			std::uint8_t p1 = raw[ index - 1 ], p2 = raw[ index - 2 ], predictor = 0;
+			switch ( variant )
+			{
+			case GrayVariant::G1:
+				predictor = gray_code( p1, 8 );
+				break;
+			case GrayVariant::G2:
+				predictor = gray_code( p2, 8 );
+				break;
+			case GrayVariant::GX:
+				predictor = gray_code( gate_xor( p1, p2, 8 ), 8 );
+				break;
+			case GrayVariant::GO:
+				predictor = gray_code( gate_or( p1, p2, 8 ), 8 );
+				break;
+			default:
+				break;
+			}
+			residual[ index ] = gate_xor( raw[ index ], predictor, 8 );
+		}
+		return residual;
+	}
+
+	std::vector<std::uint8_t> backward( const std::vector<std::uint8_t>& residual, std::uint32_t param_code ) const override
+	{
+		GrayVariant				  variant = static_cast<GrayVariant>( param_code & std::uint32_t(0x03) );
+		const std::size_t		  residual_size = residual.size();
+		std::vector<std::uint8_t> raw( residual_size, 0 );
+		if ( !residual_size )
+			return raw;
+		raw[ 0 ] = residual[ 0 ];
+		if ( residual_size == 1 )
+			return raw;
+		raw[ 1 ] = gate_xor( residual[ 1 ], raw[ 0 ], 8 );
+		for ( std::size_t index = 2; index < residual_size; ++index )
+		{
+			std::uint8_t p1 = raw[ index - 1 ], p2 = raw[ index - 2 ], predictor = 0;
+			switch ( variant )
+			{
+			case GrayVariant::G1:
+				predictor = gray_code( p1, 8 );
+				break;
+			case GrayVariant::G2:
+				predictor = gray_code( p2, 8 );
+				break;
+			case GrayVariant::GX:
+				predictor = gray_code( gate_xor( p1, p2, 8 ), 8 );
+				break;
+			case GrayVariant::GO:
+				predictor = gray_code( gate_or( p1, p2, 8 ), 8 );
+				break;
+			default:
+				break;
+			}
+			raw[ index ] = gate_xor( residual[ index ], predictor, 8 );
+		}
+		return raw;
+	}
+};
+
+// ==== Model-3: Nibble-MUX Interleave (parameterless) ====
+// Prediction approach: Simultaneously constructs two candidates per step:
+//   A: Interleave half-byte p_cross = hi(prev1) | lo(prev2)
+//   B: Unmodified copy p_run   = prev1
+// Then checks “high/low half-byte stability”: Stable → choose B, Unstable → choose A (nibble-level MUX).
+// Can be regenerated from decoded prefixes → strictly reversible; no padding.
+class ModelInterleave final : public IBooleanCircuitModel
+{
+public:
+	std::string name() const override
+	{
+		return "Model-3: Nibble-MUX Interleave";
+	}
+
+	std::vector<std::uint8_t> forward( const std::vector<std::uint8_t>& raw, std::uint32_t param_code ) const override
+	{
+		( void )param_code;	 //No warning
+		const std::size_t raw_size = raw.size();
+		std::vector<std::uint8_t> residual( raw_size, 0 );
+		if ( !raw_size )
+			return residual;
+
+		residual[0] = raw[0];
+		if (raw_size == 1) 
+			return residual;
+
+		residual[ 1 ] = gate_xor( raw[ 1 ], raw[ 0 ], 8 );
+
+		for ( size_t index = 2; index < raw_size; index++ )
+		{
+			const std::uint8_t a = raw[ index - 1 ];
+			const std::uint8_t b = raw[ index - 2 ];
+
+			const std::uint8_t p_cross = static_cast<std::uint8_t>( ( ( a & std::uint32_t( 0xF0 ) ) ) | ( b & std::uint32_t( 0x0F ) ) );
+			const std::uint8_t p_run = a;
+
+			const std::uint8_t high_equal = nibble_equal_high_mask( a, b );
+			const std::uint8_t low_equal = nibble_equal_low_mask( a, b );
+
+			const std::uint8_t select_mask = ( gate_not( high_equal, 8 ) & std::uint32_t( 0xF0 ) ) | ( gate_not( low_equal, 8 ) & std::uint32_t( 0x0F ) );
+			const std::uint8_t predictor = mux_mask( select_mask, p_cross, p_run );
+
+			residual[ index ] = gate_xor( raw[ index ], predictor, 8 );
+		}
+
+		return residual;
+	}
+
+	std::vector<std::uint8_t> backward( const std::vector<std::uint8_t>& residual, std::uint32_t param_code ) const override
+	{
+		( void )param_code;	 //No warning
+		const std::size_t residual_size = residual.size();
+		std::vector<std::uint8_t> raw( residual_size, 0 );
+		if ( !residual_size )
+			return raw;
+
+		raw[ 0 ] = residual[ 0 ];
+		if ( residual_size == 1 )
+			return raw;
+		raw[ 1 ] = gate_xor( residual[ 1 ], raw[ 0 ], 8 );
+		for ( size_t index = 2; index < residual_size; index++ )
+		{
+			const std::uint8_t a = raw[ index - 1 ];
+			const std::uint8_t b = raw[ index - 2 ];
+			const std::uint8_t p_cross = static_cast<std::uint8_t>( ( ( a & std::uint32_t( 0xF0 ) ) ) | ( b & std::uint32_t( 0x0F ) ) );
+			const std::uint8_t p_run = a;
+
+			const std::uint8_t high_equal = nibble_equal_high_mask( a, b );
+			const std::uint8_t low_equal = nibble_equal_low_mask( a, b );
+
+			const std::uint8_t select_mask = ( gate_not( high_equal, 8 ) & std::uint32_t( 0xF0 ) ) | ( gate_not( low_equal, 8 ) & std::uint32_t( 0x0F ) );
+			const std::uint8_t predictor = mux_mask( select_mask, p_cross, p_run );
+			raw[ index ] = gate_xor( residual[ index ], predictor, 8 );
+		}
+		return raw;
+	}
+
+private:
+	// High-nibble equality mask: return 0xF0 if (a>>4) == (b>>4), else 0x00
+	std::uint8_t nibble_equal_high_mask(std::uint8_t a, std::uint8_t b)
+	{
+		// XOR then isolate the high nibble and downshift to 4-bit lane
+		std::uint8_t xor_result = gate_xor(a, b, 8);
+		xor_result = static_cast<std::uint8_t>((xor_result & (unsigned int)0xF0) >> 4);
+
+		// OR-reduce 4 bits → 1 bit in LSB: any difference? (1 = different, 0 = equal)
+		std::uint8_t xor_result_linear = xor_result;
+		xor_result_linear = static_cast<std::uint8_t>(xor_result_linear | (xor_result_linear >> 2));
+		xor_result_linear = static_cast<std::uint8_t>(xor_result_linear | (xor_result_linear >> 1));
+		std::uint8_t any_bit1  = static_cast<std::uint8_t>(xor_result_linear & (unsigned int)1);
+
+		// In 1-bit lane: 1 → equal, 0 → not equal
+		std::uint8_t equal_bit1 = gate_not(any_bit1, 1);
+
+		// Broadcast that 1 bit to 0xF0 (1111 0000) without branches
+		std::uint8_t mask = static_cast<std::uint8_t>(equal_bit1 | (equal_bit1 << 1));
+		mask = static_cast<std::uint8_t>(mask | (mask << 2));
+		mask = static_cast<std::uint8_t>(mask << 4);
+		return mask;
+	}
+
+	// Low-nibble equality mask: return 0x0F if (a&0x0F) == (b&0x0F), else 0x00
+	std::uint8_t nibble_equal_low_mask(std::uint8_t a, std::uint8_t b)
+	{
+		// XOR then isolate the low nibble (already in 4-bit lane)
+		std::uint8_t xor_result = gate_xor(a, b, 8);
+		xor_result = static_cast<std::uint8_t>(xor_result & (unsigned int)0x0F);
+
+		// OR-reduce 4 bits → 1 bit in LSB: any difference? (1 = different, 0 = equal)
+		std::uint8_t xor_result_linear = xor_result;
+		xor_result_linear = static_cast<std::uint8_t>(xor_result_linear | (xor_result_linear >> 2));
+		xor_result_linear = static_cast<std::uint8_t>(xor_result_linear | (xor_result_linear >> 1));
+		std::uint8_t any_bit1  = static_cast<std::uint8_t>(xor_result_linear & (unsigned int)1);
+
+		// In 1-bit lane: 1 → equal, 0 → not equal
+		std::uint8_t equal_bit1 = gate_not(any_bit1, 1);
+
+		// Broadcast that 1 bit to 0x0F (0000 1111) without branches
+		std::uint8_t mask = static_cast<std::uint8_t>(equal_bit1 | (equal_bit1 << 1));
+		mask = static_cast<std::uint8_t>(mask | (mask << 2));
+		return mask;
+	}
+};
+
+// ------------------------------- Model 4: Majority-of-3 -------------------------------
+class ModelBM3 final : public IBooleanCircuitModel
+{
+	std::string name() const override
+	{
+		return "Model-4: Majority-of-3";
+	}
+
+	std::vector<std::uint8_t> forward( const std::vector<std::uint8_t>& raw, std::uint32_t param_code ) const override 
+	{
+		const std::size_t raw_size = raw.size();
+		std::vector<std::uint8_t> residual( raw_size, 0 );
+		if ( !raw_size )
+			return residual;
+
+		residual[ 0 ] = raw[ 0 ];
+		if ( raw_size == 1 )
+			return residual;
+		residual[ 1 ] = gate_xor( raw[ 1 ], raw[ 0 ], 8 );
+		if ( raw_size == 2 )
+			return residual;
+		residual[ 2 ] = gate_xor( raw[ 2 ], raw[ 1 ], 8 );
+
+		for(std::size_t index = 3; index < raw_size; ++index )
+		{
+			std::uint8_t predictor = gate_majority_3( raw[ index - 1 ], raw[ index - 2 ], raw[ index - 3 ] );
+			residual[ index ] = gate_xor( raw[ index ], predictor, 8 );
+		}
+	}
+
+	std::vector<std::uint8_t> backward( const std::vector<std::uint8_t>& residual, std::uint32_t param_code ) const override 
+	{
+		const std::size_t residual_size = residual.size();
+		std::vector<std::uint8_t> raw( residual_size, 0 );
+		if ( !residual_size )
+			return raw;
+
+		raw[ 0 ] = residual[ 0 ];
+		if ( residual_size == 1 )
+			return raw;
+		raw[ 1 ] = gate_xor( residual[ 1 ], raw[ 0 ], 8 );
+		if ( residual_size == 2 )
+			return raw;
+		raw[ 2 ] = gate_xor( residual[ 2 ], raw[ 1 ], 8 );
+		for(std::size_t index = 3; index < residual_size; ++index )
+		{
+			std::uint8_t predictor = gate_majority_3( raw[ index - 1 ], raw[ index - 2 ], raw[ index - 3 ] );
+			raw[ index ] = gate_xor( residual[ index ], predictor, 8 );
+		}
+	}
+}
+
+// ------------------------------- Model 5: Morpho-Predict ------------------------------
+class ModelMorpho final : public IBooleanCircuitModel
+{
+	std::string name() const override
+	{
+		return "Model-5: Morpho-Predict";
+	}
+
+	std::vector<std::uint8_t> forward( const std::vector<std::uint8_t>& raw, std::uint32_t param_code ) const override 
+	{
+		const bool use_close = ( param_code & uint32_t(0x1) ) == 0;
+		const std::size_t raw_size = raw.size();
+		std::vector<std::uint8_t> residual( raw_size, 0 );
+		if ( !raw_size )
+			return residual;
+
+		residual[ 0 ] = raw[ 0 ];
+		for(std::size_t index = 1; index < raw_size; ++index )
+		{
+			std::uint8_t data = raw[ index - 1 ];
+			std::uint8_t edge_data = edge1( data );
+			std::uint8_t morpho = use_close ? close1( data ) : open1( data );
+			std::uint8_t predictor = mux_mask( edge_data, morpho, data );
+			residual[ index ] = gate_xor( raw[ index ], predictor, 8);
+		}
+		return residual;
+	}
+
+	std::vector<std::uint8_t> backward( const std::vector<std::uint8_t>& residual, std::uint32_t param_code ) const override 
+	{
+		const bool use_close = ( param_code & uint32_t(0x1) ) == 0;
+		const std::size_t residual_size = residual.size();
+		std::vector<std::uint8_t> raw( residual_size, 0 );
+		if ( !residual_size )
+			return raw;
+
+		raw[ 0 ] = residual[ 0 ];
+		for(std::size_t index = 1; index < residual_size; ++index )
+		{
+			std::uint8_t data = raw[ index - 1 ];
+			std::uint8_t edge_data = edge1( data );
+			std::uint8_t morpho = use_close ? close1( data ) : open1( data );
+			std::uint8_t predictor = mux_mask( edge_data, morpho, data );
+			raw[ index ] = gate_xor( residual[ index ], predictor, 8);
+		}
+	}
+};
+
+inline TransformChoice make_choice( std::uint8_t code, std::uint32_t param, const std::string& name, const std::vector<std::uint8_t>& bytes )
+{
+	return TransformChoice { bytes, zero_order_entropy_bits_per_byte( bytes ), code, param, name };
+}
+
+// ---------------- M1: Delta-k (k=1..4) ----------------
+TransformChoice eval_m1_k1( const std::vector<std::uint8_t>& blk, const ModelDeltaK& m )
+{
+	const auto y = m.forward( blk, std::uint32_t( 1 ) );
+	return make_choice( std::uint8_t( 1 ), std::uint32_t( 1 ), m.name() + "[k=1]", y );
+}
+TransformChoice eval_m1_k2( const std::vector<std::uint8_t>& blk, const ModelDeltaK& m )
+{
+	const auto y = m.forward( blk, std::uint32_t( 2 ) );
+	return make_choice( std::uint8_t( 1 ), std::uint32_t( 2 ), m.name() + "[k=2]", y );
+}
+TransformChoice eval_m1_k3( const std::vector<std::uint8_t>& blk, const ModelDeltaK& m )
+{
+	const auto y = m.forward( blk, std::uint32_t( 3 ) );
+	return make_choice( std::uint8_t( 1 ), std::uint32_t( 3 ), m.name() + "[k=3]", y );
+}
+TransformChoice eval_m1_k4( const std::vector<std::uint8_t>& blk, const ModelDeltaK& m )
+{
+	const auto y = m.forward( blk, std::uint32_t( 4 ) );
+	return make_choice( std::uint8_t( 1 ), std::uint32_t( 4 ), m.name() + "[k=4]", y );
+}
+
+// ---------------- M2: Gray (4 variants) --------------
+TransformChoice eval_m2_g1( const std::vector<std::uint8_t>& blk, const ModelGrayFamily& m )
+{
+	const auto p = std::uint32_t( GrayVariant::G1 );
+	const auto y = m.forward( blk, p );
+	return make_choice( std::uint8_t( 2 ), p, m.name() + "[G1]", y );
+}
+TransformChoice eval_m2_g2( const std::vector<std::uint8_t>& blk, const ModelGrayFamily& m )
+{
+	const auto p = std::uint32_t( GrayVariant::G2 );
+	const auto y = m.forward( blk, p );
+	return make_choice( std::uint8_t( 2 ), p, m.name() + "[G2]", y );
+}
+TransformChoice eval_m2_gx( const std::vector<std::uint8_t>& blk, const ModelGrayFamily& m )
+{
+	const auto p = std::uint32_t( GrayVariant::GX );
+	const auto y = m.forward( blk, p );
+	return make_choice( std::uint8_t( 2 ), p, m.name() + "[GX]", y );
+}
+TransformChoice eval_m2_go( const std::vector<std::uint8_t>& blk, const ModelGrayFamily& m )
+{
+	const auto p = std::uint32_t( GrayVariant::GO );
+	const auto y = m.forward( blk, p );
+	return make_choice( std::uint8_t( 2 ), p, m.name() + "[GO]", y );
+}
+
+// ---------------- M3: Interleave（单一子型，忽略参数） ----
+TransformChoice eval_m3( const std::vector<std::uint8_t>& blk, const ModelInterleave& m )
+{
+	const auto y = m.forward( blk, std::uint32_t( 0 ) );  // param 不使用
+	return make_choice( std::uint8_t( 3 ), std::uint32_t( 0 ), m.name(), y );
+}
+
+// ---------------- M4: Majority-of-3 -------------------
+static TransformChoice eval_m4( const std::vector<std::uint8_t>& blk, const ModelBM3& m )
+{
+	const auto y = m.forward( blk, std::uint32_t( 0 ) );
+	return make_choice( std::uint8_t( 4 ), std::uint32_t( 0 ), m.name(), y );
+}
+
+// ---------------- M5: Morpho（close/open） -------------
+TransformChoice eval_m5_close( const std::vector<std::uint8_t>& blk, const ModelMorpho& m )
+{
+	const auto y = m.forward( blk, std::uint32_t( 0 ) );  // close1
+	return make_choice( std::uint8_t( 5 ), std::uint32_t( 0 ), m.name() + "[close1]", y );
+}
+TransformChoice eval_m5_open( const std::vector<std::uint8_t>& blk, const ModelMorpho& m )
+{
+	const auto y = m.forward( blk, std::uint32_t( 1 ) );  // open1
+	return make_choice( std::uint8_t( 5 ), std::uint32_t( 1 ), m.name() + "[open1]", y );
+}
+
+// ---------------- 评分器（保持引用语义，避免拷贝） --------
+inline const TransformChoice& pick_better( const TransformChoice& a, const TransformChoice& b )
+{
+	if ( b.H0_bits_per_byte < a.H0_bits_per_byte - 1e-12 )
+		return b;
+	if ( std::fabs( b.H0_bits_per_byte - a.H0_bits_per_byte ) <= 1e-12 )
+	{
+		if ( b.model_code < a.model_code )
+			return b;
+		if ( b.model_code == a.model_code && b.param_code < a.param_code )
+			return b;
+	}
+	return a;
+}
+
+TransformChoice circuit_map_automaton_forward( const std::vector<std::uint8_t>& raw_block )
+{
+	// Identity 备选
+	TransformChoice id { raw_block, zero_order_entropy_bits_per_byte( raw_block ), std::uint8_t( 0 ), std::uint32_t( 0 ), std::string( "Identity" ) };
+
+	// 模型实例
+	static const ModelDeltaK	 M1;
+	static const ModelGrayFamily M2;
+	static const ModelInterleave M3;
+	static const ModelBM3		 M4;
+	static const ModelMorpho	 M5;
+
+	// 并行家族评估
+	auto f_m1_k1 = std::async( std::launch::async, eval_m1_k1, std::cref( raw_block ), std::cref( M1 ) );
+	auto f_m1_k2 = std::async( std::launch::async, eval_m1_k2, std::cref( raw_block ), std::cref( M1 ) );
+	auto f_m1_k3 = std::async( std::launch::async, eval_m1_k3, std::cref( raw_block ), std::cref( M1 ) );
+	auto f_m1_k4 = std::async( std::launch::async, eval_m1_k4, std::cref( raw_block ), std::cref( M1 ) );
+
+	auto f_m2_g1 = std::async( std::launch::async, eval_m2_g1, std::cref( raw_block ), std::cref( M2 ) );
+	auto f_m2_g2 = std::async( std::launch::async, eval_m2_g2, std::cref( raw_block ), std::cref( M2 ) );
+	auto f_m2_gx = std::async( std::launch::async, eval_m2_gx, std::cref( raw_block ), std::cref( M2 ) );
+	auto f_m2_go = std::async( std::launch::async, eval_m2_go, std::cref( raw_block ), std::cref( M2 ) );
+
+	auto f_m3 = std::async( std::launch::async, eval_m3, std::cref( raw_block ), std::cref( M3 ) );
+	auto f_m4 = std::async( std::launch::async, eval_m4, std::cref( raw_block ), std::cref( M4 ) );
+	auto f_m5_c = std::async( std::launch::async, eval_m5_close, std::cref( raw_block ), std::cref( M5 ) );
+	auto f_m5_o = std::async( std::launch::async, eval_m5_open, std::cref( raw_block ), std::cref( M5 ) );
+
+	// 家族内部冠军
+	const TransformChoice  m1_a = f_m1_k1.get();
+	const TransformChoice  m1_b = f_m1_k2.get();
+	const TransformChoice  m1_c = f_m1_k3.get();
+	const TransformChoice  m1_d = f_m1_k4.get();
+	const TransformChoice& m1_win = pick_better( pick_better( m1_a, m1_b ), pick_better( m1_c, m1_d ) );
+
+	const TransformChoice  m2_a = f_m2_g1.get();
+	const TransformChoice  m2_b = f_m2_g2.get();
+	const TransformChoice  m2_c = f_m2_gx.get();
+	const TransformChoice  m2_d = f_m2_go.get();
+	const TransformChoice& m2_win = pick_better( pick_better( m2_a, m2_b ), pick_better( m2_c, m2_d ) );
+
+	const TransformChoice  m3_win = f_m3.get();
+	const TransformChoice  m4_win = f_m4.get();
+	const TransformChoice& m5_win = pick_better( f_m5_c.get(), f_m5_o.get() );
+
+	// 全局最优（含 Identity）
+	const TransformChoice& a1 = pick_better( id, m1_win );
+	const TransformChoice& a2 = pick_better( a1, m2_win );
+	const TransformChoice& a3 = pick_better( a2, m3_win );
+	const TransformChoice& a4 = pick_better( a3, m4_win );
+	const TransformChoice& best = pick_better( a4, m5_win );
+
+	return best;
+}
+
+std::vector<std::uint8_t> circuit_map_automaton_inverse( const std::vector<std::uint8_t>& mapped, uint8_t model_code, uint32_t mode_param )
+{
+	static const ModelDeltaK	 M1;
+	static const ModelGrayFamily M2;
+	static const ModelInterleave M3;
+	static const ModelBM3		 M4;
+	static const ModelMorpho	 M5;
+
+	switch ( choice.model_code )
+	{
+	case std::uint8_t( 0 ):
+		return mapped;	// Identity
+	case std::uint8_t( 1 ):
+		return M1.backward( mapped, choice.param_code );
+	case std::uint8_t( 2 ):
+		return M2.backward( mapped, choice.param_code );
+	case std::uint8_t( 3 ):
+		return M3.backward( mapped, choice.param_code );
+	case std::uint8_t( 4 ):
+		return M4.backward( mapped, choice.param_code );
+	case std::uint8_t( 5 ):
+		return M5.backward( mapped, choice.param_code );
 	default:
 		return mapped;
 	}
 }
 
-// Approximate first‑order (Markov) bit entropy function removed in V2.
-// The V2 pipeline does not rely on entropy heuristics when selecting
-// transforms.  The implementation of first_order_bit_entropy is retained
-// below but disabled via #if 0 to document the previous approach.
-#if 0
-double first_order_bit_entropy( const std::vector<std::uint8_t>& block )
-{
-	std::size_t nbits = block.size() * 8;
-	if ( nbits < 2 )
-		return 1.0;
-	// counts[x][y] counts transitions from bit x to bit y.
-	std::array<std::array<std::uint64_t, 2>, 2> counts {};
-	// Initialize prev bit to the MSB of first byte.
-	std::uint8_t prev = ( block[ 0 ] >> 7 ) & 1u;
-	std::size_t bit_idx = 1;
-	bool skip_first = true;
-	for ( std::uint8_t b : block )
-	{
-		for ( int k = 0; k < 8; ++k )
-		{
-			if ( skip_first )
-			{
-				// Skip the very first bit; it has no predecessor.
-				skip_first = false;
-				continue;
-			}
-			std::uint8_t bit = ( b >> ( 7 - k ) ) & 1u;
-			counts[ prev ][ bit ] += 1;
-			prev = bit;
-			++bit_idx;
-		}
-	}
-	double total_trans = static_cast<double>( nbits - 1 );
-	double H = 0.0;
-	for ( int x = 0; x <= 1; ++x )
-	{
-		double px = static_cast<double>( counts[ x ][ 0 ] + counts[ x ][ 1 ] );
-		if ( px == 0 )
-			continue;
-		for ( int y = 0; y <= 1; ++y )
-		{
-			double pxy = static_cast<double>( counts[ x ][ y ] );
-			if ( pxy == 0 )
-				continue;
-			double p_y_given_x = pxy / px;
-			H -= ( pxy / total_trans ) * std::log2( p_y_given_x );
-		}
-	}
-	return H;
-}
-#endif
-
-// Average run length for a binary sequence.  Count number of runs and divide
-// length by run count.
-double avg_run_bits( const std::vector<int>& bits )
-{
-#if 0
-	// Legacy implementation retained for reference.  Computes the average run
-	// length of a binary sequence by counting transitions.
-	if ( bits.empty() )
-		return 0.0;
-	std::size_t runs = 1;
-	int prev = bits[ 0 ];
-	for ( std::size_t i = 1; i < bits.size(); ++i )
-	{
-		if ( bits[ i ] != prev )
-		{
-			runs++;
-			prev = bits[ i ];
-		}
-	}
-	return static_cast<double>( bits.size() ) / runs;
-#endif
-	(void)bits; // suppress unused parameter warning in active builds
-	return 0.0;
-}
-
-// 0th‑order entropy of a binary sequence.  Uses natural log base 2.
-double H0_bits( const std::vector<int>& bits )
-{
-#if 0
-	// Legacy implementation retained for reference.  Computes the zero‑order
-	// binary entropy (base‑2) using the proportion of ones.
-	if ( bits.empty() )
-		return 0.0;
-	std::size_t n = bits.size();
-	std::size_t c1 = std::count( bits.begin(), bits.end(), 1 );
-	double p = static_cast<double>( c1 ) / static_cast<double>( n );
-	if ( p == 0.0 || p == 1.0 )
-		return 0.0;
-	return -p * std::log2( p ) - ( 1.0 - p ) * std::log2( 1.0 - p );
-#endif
-	(void)bits; // suppress unused parameter warning in active builds
-	return 0.0;
-}
-
-// Compute 0th‑order entropy of a byte array.  Used by the automaton selector.
-double zero_order_entropy( const std::vector<std::uint8_t>& data )
-{
-	if ( data.empty() )
-		return 0.0;
-	std::array<std::uint64_t, 256> counts {};
-	for ( auto b : data )
-		counts[ b ]++;
-	double h = 0.0;
-	double n = static_cast<double>( data.size() );
-	for ( auto c : counts )
-	{
-		if ( c == 0 )
-			continue;
-		double p = static_cast<double>( c ) / n;
-		h -= p * std::log2( p );
-	}
-	return h;
-}
+// ----------------------------- Boolean circuit gates ends here -------------------------------
 
 // Split bytes -> 8 MSB-first bit-planes.
 // planes[j][t] is bit j (0..7, MSB-first) of data[t] as 0/1.
@@ -2403,6 +2785,9 @@ std::vector<std::uint8_t> decode_bbwt_mtf_rice( const std::vector<std::uint8_t>&
 	return bbwt_inverse( bbwt );
 }
 
+// Write positions P (strictly increasing) using Elias–Fano coding.
+// Read positions encoded via Elias–Fano.
+
 void ef_write_positions( const std::vector<std::uint32_t>& ends, const EFParams& ep, BitWriter& bw )
 {
 	const std::uint32_t M = ep.M;
@@ -2906,172 +3291,199 @@ std::int32_t zigzag_decode_32( std::uint32_t n )
 	return static_cast<std::int32_t>( ( n >> 1 ) ^ ( static_cast<std::int32_t>( -( n & 1u ) ) ) );
 }
 
-// Write positions P (strictly increasing) using Elias–Fano coding.
-// Read positions encoded via Elias–Fano.
-// Encode V2 using the slim header (no flag/L/run_count/paylen).
-// Layout:
-//   header:
-//	 hdr0	: 1B, top 3 bits store 'mode' => hdr0 = (mode & 7) << 5
-//	 raw_mask: 1B, bit j==1 means plane j is RAW (packed bits)
-//	 b1_mask : 1B, bit j stores the first run bit (b1) for ENCODED planes
-//	 k_list  : 1B per ENCODED plane (in j order), Rice parameter k
-//   payload (byte-aligned per plane, no cross-plane bit sharing):
-//	 for j = 0..7:
-//	   if RAW	=> ceil(L/8) bytes of packed bits (MSB-first)
-//	   if ENCODED=> Rice bitstream for runs (padded to next byte)
+// ============================== V2 slim header (Variable-length param) ==============================
 //
-// Notes:
-// - L (plane length in symbols) is exactly the block's byte length, and the
-//   decoder receives it from the container (orig_len). We do not store L here.
-// - Each plane chooses RAW vs (BBWT -> RLE -> Rice(best k)) by comparing sizes.
-//   If ENCODED is chosen, we store 1B k and the b1 bit in b1_mask.
-std::pair<std::vector<std::uint8_t>, std::unordered_map<std::string, std::string>> encode_new_pipeline( const std::vector<std::uint8_t>& block )
+// Layout (byte-aligned; no cross-plane bit sharing):
+//   header0 : 1B
+//			  bits[7:5] = mode ∈ {0..7}				  // automaton/model id
+//			  bits[4:3] = 0							  // reserved for future use (must be 0)
+//			  bits[2:0] = param_len ∈ {0..4}			 // number of following param bytes (LE); 5..7 invalid
+//   param   : param_len bytes, LE32 fragment of mode_param // if param_len=0, this field is absent
+//   raw_mask: 1B, bit j==1 ⇒ plane j is RAW (packed bits)
+//   b1_mask : 1B, bit j	 stores the first run bit b₁ for ENCODED planes
+//   k_list  : 1B per ENCODED plane, in plane order j=0..7  // Rice parameter k for each ENCODED plane
+//   payload : concatenation of per-plane bytes, each plane byte-aligned
+//
+// Notes (variables with mathematical meaning):
+//   L		 : plane length in symbols (bytes), i.e., original block length |block|. The container passes L (orig_len).
+//   U_j	   : j-th bit-plane, j ∈ {0..7}; U_j is a 0/1 sequence of length L (MSB-first per byte when packing).
+//   b₁		: first run bit for the RLE over the BBWT-transformed plane.
+//   runs	  : the run-length sequence produced by RLE over the BBWT output bits.
+//   mode	  : chosen automaton/model id (Identity, Delta-k, Gray, Interleave, BM3, Morpho, ...).
+//   mode_param: the automaton parameter (e.g., k for Delta-k, variant code for Gray, etc.).
+//
+// Rationale:
+//   - The decoder cannot infer (mode, mode_param) from mapped data alone; these must be carried in the header.
+//   - param_len makes the param field self-describing and allows 0 overhead for models with no parameter.
+//   - All fields remain byte-aligned; planes and Rice streams keep their original alignment.
+// =============================================================================================================
+std::vector<std::uint8_t> encode_new_pipeline( const std::vector<std::uint8_t>& block )
 {
-	std::unordered_map<std::string, std::string> meta;	// unused, kept for symmetry
+	// Early-out for empty input
 	if ( block.empty() )
-		return { std::vector<std::uint8_t> {}, meta };
+		return {};
 
-	// 1) reversible automaton on byte stream
-	auto							 ar = circuit_map_automaton_forward( block );  // {data, mode}
-	const std::vector<std::uint8_t>& mapped = ar.data;
-	const std::uint8_t				 mode = ar.mode & 0x07;
+	// 1) Apply a reversible automaton (Boolean-circuit mapping) on the byte stream.
+	//	The forward mapping returns both the transformed bytes and the (mode, mode_param) needed for inversion.
+	TransformChoice					 boolean_circuit_result = circuit_map_automaton_forward( block );
+	const std::vector<std::uint8_t>& mapped	  = boolean_circuit_result.transform_bytes;
+	const std::uint8_t				 mode		= static_cast<std::uint8_t>( boolean_circuit_result.model_code & std::uint8_t( 0x07 ) );
+	const std::uint32_t				 mode_param  = boolean_circuit_result.param_code;
 
-	// 2) split into 8 MSB-first bit-planes
-	auto [ planes, L ] = bytes_to_bitplanes( mapped );	// planes[j] is vector<int> of {0,1}
-	const std::size_t nbytes_plane = ( L + 7u ) / 8u;
+	// 2) Split mapped bytes into 8 MSB-first bit-planes: U_j ∈ {0,1}^L (j = 0..7).
+	auto [ planes, L ] = bytes_to_bitplanes( mapped );
 
-	// 3) decide RAW vs ENCODED per plane, collect masks/k/payload chunks
-	std::uint8_t			  raw_mask = 0;
-	std::uint8_t			  b1_mask = 0;
-	std::vector<std::uint8_t> k_list;
+	// 3) For each plane decide RAW vs ENCODED and collect metadata plus per-plane chunk.
+	std::uint8_t			  raw_mask = 0;   // bit j==1 ⇒ RAW plane
+	std::uint8_t			  b1_mask  = 0;   // for ENCODED planes only, bit j stores b₁
+	std::vector<std::uint8_t> k_list;		// for ENCODED planes only, Rice parameter k in j order
 	k_list.reserve( 8 );
-	std::vector<std::vector<std::uint8_t>> chunks;
+
+	std::vector<std::vector<std::uint8_t>> chunks; // per-plane payloads (already byte-aligned)
 	chunks.reserve( 8 );
 
 	for ( int j = 0; j < 8; ++j )
 	{
-		const auto& Uj = planes[ j ];
+		const auto& Uj = planes[ j ];  // math: U_j
 
-		// RAW candidate: pack bits MSB-first into bytes
+		// RAW candidate: bits → bytes (MSB-first packing)
 		const auto raw_bytes = pack_bits_to_bytes( Uj );
 
-		// ENCODED candidate: BBWT -> RLE -> Rice (choose best k)
-		// Convert 0/1 ints to bytes for BBWT
+		// ENCODED candidate: BBWT(U_j bits as bytes) → RLE → Rice(best k)
 		std::vector<std::uint8_t> Uj8;
 		Uj8.reserve( Uj.size() );
-		for ( int b : Uj )
-			Uj8.push_back( static_cast<std::uint8_t>( b & 1 ) );
-		const auto Lj_bytes = bbwt_forward( Uj8 );
+		for ( int b : Uj ) Uj8.push_back( static_cast<std::uint8_t>( b & 1 ) );
+
+		const auto Lj_bytes = bbwt_forward( Uj8 );	// BBWT over {0,1} bytes, length L
 
 		std::vector<int> Lj_bits;
 		Lj_bits.reserve( Lj_bytes.size() );
-		for ( auto v : Lj_bytes )
-			Lj_bits.push_back( static_cast<int>( v & 1 ) );
+		for ( auto v : Lj_bytes ) Lj_bits.push_back( static_cast<int>( v & 1 ) );
 
-		auto		rle = rle_binary( Lj_bits );  // pair<int first_bit, vector<int> runs>
-		const int	b1 = rle.first & 1;
-		const auto& runs_i = rle.second;
+		const auto   rle = rle_binary( Lj_bits ); // (b₁, runs)
+		const int	b1  = rle.first & 1;
+		const auto&  runs_i = rle.second;
 
 		if ( runs_i.empty() )
 		{
-			// Degenerate: encode as RAW
-			raw_mask |= ( 1u << j );
+			// Degenerate: no runs ⇒ fall back to RAW
+			raw_mask |= static_cast<std::uint8_t>( 1u << j );
 			chunks.push_back( raw_bytes );
 			continue;
 		}
 
-		// Cast runs to 32-bit and choose best Rice k in [0..15].
 		std::vector<std::uint32_t> runs;
 		runs.reserve( runs_i.size() );
-		for ( int v : runs_i )
-			runs.push_back( static_cast<std::uint32_t>( v ) );
-		auto [ k_opt, rice_bytes ] = choose_best_rice( runs );
+		for ( int v : runs_i ) runs.push_back( static_cast<std::uint32_t>( v ) );
 
-		// Compare sizes: ENCODED pays +1B for 'k'
+		auto [ k_opt, rice_bytes ] = choose_best_rice( runs ); // returns byte-aligned stream
+
+		// Size decision: ENCODED pays +1B in header for its 'k'.
 		if ( raw_bytes.size() <= rice_bytes.size() + 1u )
 		{
-			raw_mask |= ( 1u << j );
+			raw_mask |= static_cast<std::uint8_t>( 1u << j );
 			chunks.push_back( raw_bytes );
 		}
 		else
 		{
-			if ( b1 )
-				b1_mask |= ( 1u << j );
+			if ( b1 ) b1_mask |= static_cast<std::uint8_t>( 1u << j );
 			k_list.push_back( static_cast<std::uint8_t>( k_opt & 0xFF ) );
 			chunks.push_back( std::move( rice_bytes ) );
 		}
 	}
 
-	// 4) assemble header
+	// Compute param_len ∈ {0..4} for LE32(mode_param).
+	const auto param_len_of = []( std::uint32_t p ) -> std::uint8_t {
+		if ( p == 0u )					return std::uint8_t( 0 );
+		if ( ( p & 0xFFFFFF00u ) == 0u )  return std::uint8_t( 1 );
+		if ( ( p & 0xFFFF0000u ) == 0u )  return std::uint8_t( 2 );
+		if ( ( p & 0xFF000000u ) == 0u )  return std::uint8_t( 3 );
+		return std::uint8_t( 4 );
+	};
+	const std::uint8_t param_len = param_len_of( mode_param );
+
+	// 4) Assemble slim header: header0, param (LE, param_len bytes), raw_mask, b1_mask, k_list(for ENCODED planes only).
 	std::vector<std::uint8_t> header;
-	header.reserve( 3 + k_list.size() );
-	const std::uint8_t hdr0 = ( mode & 0x07 ) << 5;
-	header.push_back( hdr0 );
+	header.reserve( static_cast<std::size_t>( 3 + param_len ) + k_list.size() ); // 1+param_len+1+1+k_list
+
+	const std::uint8_t header0 = static_cast<std::uint8_t>( ( ( mode & 0x07u ) << 5 ) | ( param_len & 0x07u ) );
+	header.push_back( header0 );
+
+	for ( std::uint8_t i = 0; i < param_len; ++i )
+		header.push_back( static_cast<std::uint8_t>( ( mode_param >> ( 8u * i ) ) & 0xFFu ) );
+
 	header.push_back( raw_mask );
 	header.push_back( b1_mask );
-	// append k_list in plane order (only for encoded planes)
+
+	// Emit k_list in plane order for ENCODED planes only (where raw_mask bit is 0).
 	{
 		std::size_t idx = 0;
 		for ( int j = 0; j < 8; ++j )
-		{
 			if ( ( ( raw_mask >> j ) & 1 ) == 0 )
-			{
 				header.push_back( k_list[ idx++ ] );
-			}
-		}
 	}
 
-	// 5) payload = concat of per-plane bytes (each already byte-aligned)
+	// 5) Concatenate plane payloads (each already byte-aligned).
 	std::vector<std::uint8_t> payload;
 	std::size_t				  payload_sz = 0;
-	for ( auto& ch : chunks )
-		payload_sz += ch.size();
+	for ( const auto& ch : chunks ) payload_sz += ch.size();
 	payload.reserve( payload_sz );
-	for ( auto& ch : chunks )
-		payload.insert( payload.end(), ch.begin(), ch.end() );
+	for ( const auto& ch : chunks ) payload.insert( payload.end(), ch.begin(), ch.end() );
 
-	// return header || payload
+	// Return header || payload.
 	std::vector<std::uint8_t> out;
 	out.reserve( header.size() + payload.size() );
 	out.insert( out.end(), header.begin(), header.end() );
 	out.insert( out.end(), payload.begin(), payload.end() );
-	return { std::move( out ), std::move( meta ) };
+	return out;
 }
 
-// Decode V2 slim header. The container tells us 'orig_len' (L).
-// We parse hdr0/raw_mask/b1_mask/k_list, then for each plane:
-//  - RAW	 : read ceil(L/8) bytes and unpack bits
-//  - ENCODED : read a Rice bitstream until sum(runs)==L, then byte-align
-// After reconstructing 8 planes, we pack them back to bytes and invert
-// the automaton selected by 'mode'.
-std::vector<std::uint8_t> decode_new_pipeline( const std::vector<std::uint8_t>& payload, std::size_t orig_len, const std::unordered_map<std::string, std::string>& /*meta*/ )
+// -------------------------------- DECODE: parse V2 slim header and rebuild mapped bytes --------------------------------
+std::vector<std::uint8_t> decode_new_pipeline( const std::vector<std::uint8_t>& payload, std::size_t orig_len )
 {
-	const std::size_t L = orig_len;
-	if ( L == 0 )
-		return {};
-	if ( payload.size() < 3 )
-		throw std::runtime_error( "V2 slim header truncated" );
+	const std::size_t L = orig_len;	 // |block| in bytes; equals the length of each U_j
+	if ( L == 0 ) return {};
+	if ( payload.size() < 1 ) throw std::runtime_error( "V2 slim header truncated (missing header0)" );
 
-	std::size_t		   pos = 0;
-	const std::uint8_t hdr0 = payload[ pos++ ];
-	const std::uint8_t raw_mask = payload[ pos++ ];
-	const std::uint8_t b1_mask = payload[ pos++ ];
-	const std::uint8_t mode = ( hdr0 >> 5 ) & 0x07;
+	std::size_t slim_pos = 0;
 
-	// read k_list for encoded planes, in j order
-	const int enc_count = 8 - std::popcount( raw_mask );
-	if ( pos + static_cast<std::size_t>( enc_count ) > payload.size() )
+	// header0
+	const std::uint8_t header0   = payload[ slim_pos++ ];
+	const std::uint8_t mode	  = static_cast<std::uint8_t>( ( header0 >> 5 ) & 0x07u );
+	const std::uint8_t param_len = static_cast<std::uint8_t>( header0 & 0x07u );
+
+	if ( param_len > 4 ) throw std::runtime_error( "V2 slim header invalid param_len (>4)" );
+
+	// Ensure we have enough bytes for param + raw_mask + b1_mask.
+	const std::size_t min_after_h0 = static_cast<std::size_t>( param_len ) + 2u;
+	if ( payload.size() < 1u + min_after_h0 )
+		throw std::runtime_error( "V2 slim header truncated (param/raw/b1)" );
+
+	// param (LE), exactly param_len bytes
+	std::uint32_t mode_param = 0;
+	for ( std::uint8_t i = 0; i < param_len; ++i )
+		mode_param |= static_cast<std::uint32_t>( payload[ slim_pos++ ] ) << ( 8u * i );
+
+	// masks
+	const std::uint8_t raw_mask = payload[ slim_pos++ ];
+	const std::uint8_t b1_mask  = payload[ slim_pos++ ];
+
+	// k_list for ENCODED planes (in j order).
+	// NOTE: std::popcount requires <bit> and C++20; provide a fallback if your toolchain lacks it.
+	const int enc_count = 8 - std::popcount( static_cast<unsigned int>( raw_mask ) );
+	if ( slim_pos + static_cast<std::size_t>( enc_count ) > payload.size() )
 		throw std::runtime_error( "V2 slim header k_list truncated" );
+
 	std::vector<std::uint8_t> k_list;
 	k_list.reserve( enc_count );
 	for ( int i = 0; i < enc_count; ++i )
-		k_list.push_back( payload[ pos++ ] );
+		k_list.push_back( payload[ slim_pos++ ] );
 
-	// payload bytes start here
-	const std::vector<std::uint8_t> data( payload.begin() + pos, payload.end() );
+	// Data bytes start here.
+	const std::vector<std::uint8_t> data( payload.begin() + slim_pos, payload.end() );
 	std::size_t						data_pos = 0;  // byte index inside 'data'
 
-	std::vector<std::vector<int>> planes;
+	std::vector<std::vector<int>> planes; // reconstructed U_j
 	planes.reserve( 8 );
 	auto k_it = k_list.begin();
 
@@ -3079,59 +3491,61 @@ std::vector<std::uint8_t> decode_new_pipeline( const std::vector<std::uint8_t>& 
 	{
 		if ( ( ( raw_mask >> j ) & 1 ) == 1 )
 		{
-			// RAW plane
+			// RAW plane: fixed size ceil(L/8) bytes
 			const std::size_t need = ( L + 7u ) / 8u;
 			if ( data_pos + need > data.size() )
 				throw std::runtime_error( "V2 payload truncated in RAW plane" );
+
 			std::vector<std::uint8_t> buf( data.begin() + data_pos, data.begin() + data_pos + need );
 			data_pos += need;
-			planes.push_back( unpack_bits_from_bytes( buf, L ) );
+
+			planes.push_back( unpack_bits_from_bytes( buf, L ) );  // U_j
 		}
 		else
 		{
-			// ENCODED plane: Rice until sum==L, then align to next byte
+			// ENCODED plane: Rice-coded runs until sum(runs) == L, then align to next byte boundary.
 			if ( k_it == k_list.end() )
 				throw std::runtime_error( "k_list exhausted" );
-			const int k = static_cast<int>( *k_it++ & 0xFF );
+
+			const int k  = static_cast<int>( *k_it++ & 0xFF );
 			const int b1 = ( b1_mask >> j ) & 1;
 
 			BitReader  br( data, data_pos, 0 );
-			const auto runs32 = rice_decode_until_len( br, k, L );
+			const auto runs32 = rice_decode_until_len( br, k, L );	// returns uint32_t runs summing to L
 			br.align_next_byte();
 			auto [ next_byte, _bit ] = br.tell();
 			data_pos = next_byte;
 
-			// RLE inverse -> BBWT inverse -> plane bits
 			std::vector<int> runs_i;
 			runs_i.reserve( runs32.size() );
-			for ( auto v : runs32 )
-				runs_i.push_back( static_cast<int>( v ) );
-			const auto Lj_bits = unrle_binary( b1, runs_i );
+			for ( auto v : runs32 ) runs_i.push_back( static_cast<int>( v ) );
+
+			const auto Lj_bits = unrle_binary( b1, runs_i ); // {0,1}^L
 
 			std::vector<std::uint8_t> Lj_bytes;
 			Lj_bytes.reserve( Lj_bits.size() );
-			for ( auto b : Lj_bits )
-				Lj_bytes.push_back( static_cast<std::uint8_t>( b & 1 ) );
+			for ( auto b : Lj_bits ) Lj_bytes.push_back( static_cast<std::uint8_t>( b & 1 ) );
 
-			auto Uj_bytes = bbwt_inverse( Lj_bytes );  // length should be L
+			auto Uj_bytes = bbwt_inverse( Lj_bytes ); // length should be L
+
+			// Defensive fix-up (robustness): enforce length L.
 			if ( Uj_bytes.size() != L )
 			{
-				if ( Uj_bytes.size() > L )
-					Uj_bytes.resize( L );
-				else
-					Uj_bytes.insert( Uj_bytes.end(), L - Uj_bytes.size(), 0 );
+				if ( Uj_bytes.size() > L ) Uj_bytes.resize( L );
+				else					   Uj_bytes.insert( Uj_bytes.end(), L - Uj_bytes.size(), std::uint8_t( 0 ) );
 			}
+
 			std::vector<int> Uj;
 			Uj.reserve( Uj_bytes.size() );
-			for ( auto b : Uj_bytes )
-				Uj.push_back( static_cast<int>( b & 1 ) );
+			for ( auto b : Uj_bytes ) Uj.push_back( static_cast<int>( b & 1 ) );
+
 			planes.push_back( std::move( Uj ) );
 		}
 	}
 
-	// merge planes -> bytes, invert automaton
+	// Merge planes → bytes, then invert the selected automaton to recover the original block.
 	const auto mapped = bitplanes_to_bytes( planes );
-	return circuit_map_automaton_inverse( mapped, mode );
+	return circuit_map_automaton_inverse( mapped, mode, mode_param );
 }
 
 // Top‑level compression: break input data into content‑defined blocks,
@@ -3191,7 +3605,7 @@ using Decoder = std::function<ByteVector( const ByteVector&, std::size_t, const 
 
 // Return the fixed, ordered list of encoder candidates.
 // NOTE: Order MUST match the decoder table below (0..10).
-static const std::vector<Encoder>& _encoder_candidates()
+static const std::vector<Encoder>& _select_encoder()
 {
 	static const std::vector<Encoder> v = {
 		// 0 raw
@@ -3258,15 +3672,16 @@ static const std::vector<Encoder>& _encoder_candidates()
 		},
 		// 10 V2 new pipeline
 		[]( ByteSpan s ) {
-			ByteVector				  v( s.begin(), s.end() );
-			return encode_new_pipeline( v );
+			ByteVector v( s.begin(), s.end() );
+			ByteVector p = encode_new_pipeline( v );
+			return std::make_pair( std::move(p), MetaMap{} );
 		},
 	};
 	return v;
 }
 
 // Decoder table aligned with the encoder list above (same indices).
-static const std::vector<Decoder>& _decoder_table()
+static const std::vector<Decoder>& _select_decoder()
 {
 	static const std::vector<Decoder> v = {
 		// 0 raw
@@ -3320,7 +3735,7 @@ static const std::vector<Decoder>& _decoder_table()
 		// 9 Re-Pair
 		[]( const ByteVector& p, std::size_t L, const MetaMap& ) { return repair_decompress( p, L ); },
 		// 10 V2 new pipeline
-		[]( const ByteVector& p, std::size_t L, const MetaMap& ) { return decode_new_pipeline( p, L, MetaMap {} ); },
+		[]( const ByteVector& p, std::size_t L, const MetaMap& ) { return decode_new_pipeline( p, L ); },
 	};
 	return v;
 }
@@ -3362,7 +3777,7 @@ std::vector<size_t> _active_methods( size_t total_methods )
 // Choose the smallest encoding for one block (MDL selection).
 _Best _select_best( ByteSpan block )
 {
-	const auto& candidates = _encoder_candidates();
+	const auto& candidates = _select_encoder();
 	std::size_t best_cost = std::numeric_limits<std::size_t>::max();
 	std::size_t best_id = 0;
 	ByteVector	best_payload;
@@ -3397,7 +3812,7 @@ _Best _select_best( ByteSpan block )
 // Decode one block by method id (bounds-checked dispatch).
 ByteVector _decode_by_id( std::uint8_t method_id, const ByteVector& payload, std::size_t orig_len )
 {
-	const auto& dec = _decoder_table();
+	const auto& dec = _select_decoder();
 	if ( method_id >= dec.size() )
 		throw std::runtime_error( "decompress: unknown method id" );
 	return dec[ method_id ]( payload, orig_len, MetaMap {} );
@@ -4732,15 +5147,15 @@ static void print_help( const char* prog )
 			  << "  " << prog << " [options] <input>\n"
 			  << "  " << prog << " --experiment [--no-lz77] [--only <name|id>] [--progress]\n\n"
 			  << "Modes:\n"
-			  << "  -d, --decompress              Decompress container\n"
-			  << "  -o, --output <file>           Output file\n"
-			  << "  -b, --block <N>               FIXED block size (default 8192) or FastCDC avg_size\n"
-			  << "      --FastCDC, --fastcdc      Use Fast Content-Defined Chunking (avg_size = --block)\n"
-			  << "      --experiment              Run built-in experiment (self-test) and exit\n"
-			  << "      --no-lz77                 Disable LZ77 candidate\n"
-			  << "      --container TOC|SIMPLE    Container format (default TOC)\n"
-			  << "      --only <name|id>          Only use one method (raw/xor/bbwt/.../v2 or 0..10)\n"
-			  << "  -h, --help                    Show this help\n\n"
+			  << "  -d, --decompress			  Decompress container\n"
+			  << "  -o, --output <file>		   Output file\n"
+			  << "  -b, --block <N>			   FIXED block size (default 8192) or FastCDC avg_size\n"
+			  << "	  --FastCDC, --fastcdc	  Use Fast Content-Defined Chunking (avg_size = --block)\n"
+			  << "	  --experiment			  Run built-in experiment (self-test) and exit\n"
+			  << "	  --no-lz77				 Disable LZ77 candidate\n"
+			  << "	  --container TOC|SIMPLE	Container format (default TOC)\n"
+			  << "	  --only <name|id>		  Only use one method (raw/xor/bbwt/.../v2 or 0..10)\n"
+			  << "  -h, --help					Show this help\n\n"
 			  << "Examples:\n"
 			  << "  " << prog << " data.bin\n"
 			  << "  " << prog << " --FastCDC -b 16384 data.bin\n"
